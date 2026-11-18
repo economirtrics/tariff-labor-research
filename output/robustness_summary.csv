@@ -1,0 +1,11 @@
+spec,channel,delta_M,se,t,sig,pretrend_p
+"Baseline (joint, county x month FE)",IP,-1.048,2.064,-0.51,"",0.73
+"Baseline (joint, county x month FE)",RIC,3.956,3.001,1.32,"",0.856
+IP only,IP,0.253,1.281,0.2,"",0.294
+RIC only,RIC,2.787,2.075,1.34,"",0.093
+Trim top 1% (AT2026),IP,0.137,2.54,0.05,"",0.473
+Trim top 1% (AT2026),RIC,2.88,3.152,0.91,"",0.838
+Trim both tails 1%,IP,0.116,2.572,0.04,"",0.48
+Trim both tails 1%,RIC,2.938,3.236,0.91,"",0.817
+Suppressed imputed,IP,-0.629,1.62,-0.39,"",0.423
+Suppressed imputed,RIC,2.57,2.235,1.15,"",0.997

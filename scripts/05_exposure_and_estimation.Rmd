@@ -1,0 +1,508 @@
+---
+title: "Dynamic local labor-market effects of the 2025 U.S. tariffs"
+subtitle: "Exposure construction, distributed-lag event study, and counterfactuals"
+author: "Amir Azlan, University of Illinois Urbana-Champaign"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: paged
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 9, fig.height = 4.8, dpi = 110)
+
+need <- c("data.table", "arrow", "fixest", "ggplot2", "scales")
+miss <- need[!vapply(need, requireNamespace, logical(1), quietly = TRUE)]
+if (length(miss)) {
+  stop("Install first: install.packages(c(",
+       paste0('"', miss, '"', collapse = ", "), "))")
+}
+library(data.table); library(ggplot2); library(fixest)
+
+# Find the project root (the folder that contains data/processed)
+find_root <- function(start = getwd()) {
+  p <- normalizePath(start)
+  while (!dir.exists(file.path(p, "data", "processed")) && dirname(p) != p) p <- dirname(p)
+  p
+}
+root <- find_root()
+proc <- file.path(root, "data", "processed")
+rawd <- file.path(root, "data", "raw")
+figd <- file.path(root, "output", "figures"); dir.create(figd, recursive = TRUE, showWarnings = FALSE)
+knitr::opts_knit$set(root.dir = root)
+```
+
+# 0. Design and parameters
+
+> **Status.** Sections 1-4 of this file build the exposure measures used by every later
+> script and are current. The distributed-lag estimates in sections 6-7 are **not** the
+> project's main results: `07_diagnostics_and_lp.Rmd` shows that cumulating coefficients on a
+> monthly-change regressor does not measure the effect of a permanent tariff increase, and
+> that the specification is over-parameterized for a single synchronized shock. The main
+> results are in `08_event_study_levels.Rmd`. Sections 6-7 are kept as a documented alternative.
+
+This file continues Azzimonti & Titcomb (2026) (AT2026). It rebuilds their exposure
+measures (Local Import Protection, IP; Local Rising Input Costs, RIC) from realized tariffs
+and replaces their static regression with a **distributed-lag event study** whose
+coefficients are cumulated into the *cumulative effect of policy*
+
+$$
+\delta_k=\begin{cases}0 & k<-G\\ \sum_{m=-G}^{k}\beta_m & -G\le k\le M\\ \sum_{m=-G}^{M}\beta_m & k>M\end{cases}
+$$
+
+from
+
+$$
+u_{c,t}=\alpha_{c,\text{month}}+\gamma_t+\sum_{m=-G}^{M}\Big(\beta^{IP}_m\,\Delta IP_{c,t-m}+\beta^{RIC}_m\,\Delta RIC_{c,t-m}\Big)+\varepsilon_{c,t},
+$$
+
+where $m<0$ are leads (pre-trend tests), $\alpha_{c,\text{month}}$ is a county x calendar-month fixed
+effect (LAUS county series are not seasonally adjusted), and $\gamma_t$ a date fixed effect.
+Standard errors are clustered by state.
+
+```{r params}
+G <- 3          # leads
+M <- 9          # lags
+bea_year   <- 2024      # base year for BEA tables (AT2026 base year is 2024)
+tau_cap    <- 2.5       # cap on pair-level realized tariff (250%) to remove data artefacts
+first_month <- as.Date("2024-01-01")   # first month of customs panel (set to 2023-01-01 once every 2023 month is complete)
+last_month  <- as.Date("2026-03-01")   # last month of customs panel
+est_start   <- as.Date("2024-01-01")   # outcome months used in estimation
+# Leads need shocks G months ahead, so outcomes must end G months before the last shock month
+est_end <- seq(last_month, by = paste0("-", G, " months"), length.out = 2)[2]
+cat("Estimation months:", format(est_start), "to", format(est_end), "\n")
+```
+
+# 1. BEA use table: absorption and input shares
+
+BEA Summary use table (millions of dollars). Layout verified on the 2024 file: header codes
+on row 4, a "Name" row, commodity rows, then the totals `T005` (total intermediate),
+`V001` (compensation), `T018` (total industry output); final-demand columns include `F040`
+(exports) and `T019` (total use).
+
+```{r bea}
+read_bea <- function(path) {
+  x <- fread(path, skip = 3, header = TRUE, encoding = "Latin-1",
+             na.strings = c("---", "...", ""), colClasses = "character")
+  setnames(x, 1, "code")
+  x <- x[-1]                                        # drop the "Name" row
+  vals <- setdiff(names(x), c("code", "Commodities/Industries"))
+  x[, (vals) := lapply(.SD, function(v) as.numeric(gsub(",", "", v))), .SDcols = vals]
+  for (v in vals) set(x, which(is.na(x[[v]])), v, 0)
+  x
+}
+bea <- read_bea(file.path(rawd, sprintf("%d BEA Table.csv", bea_year)))
+ind_codes <- names(bea)[3:(which(names(bea) == "T001") - 1)]   # industry columns
+com_rows  <- bea[code %in% ind_codes, code]                    # commodity rows (same codes)
+cat(length(ind_codes), "BEA industries;", length(com_rows), "commodity rows\n")
+
+U     <- as.matrix(bea[match(com_rows, code), ..ind_codes]); rownames(U) <- com_rows
+iota  <- unlist(bea[code == "T005", ..ind_codes])   # total intermediate inputs by industry
+omega <- unlist(bea[code == "V001", ..ind_codes])   # compensation of employees
+Qout  <- unlist(bea[code == "T018", ..ind_codes])   # industry output
+Xexp  <- setNames(bea[match(com_rows, code), F040], com_rows)  # exports by commodity
+
+denom <- iota + omega
+S <- sweep(U, 2, ifelse(denom > 0, denom, NA), "/")  # S[h, i]: input share of commodity h in industry i
+S[is.na(S)] <- 0
+stopifnot(all(colSums(S) <= 1.05))   # input shares of an industry cannot exceed ~1
+```
+
+# 2. Industry tariffs from realized duties
+
+Industry group used throughout = BEA Summary group: NAICS-3 except 311+312, 313+314,
+315+316 are merged (BEA), and 336 is kept whole (BEA splits it, QCEW cannot).
+Realized tariffs use **fixed 2024 product-country import weights** (AT2026 eq. for
+$\tau^{r,b}_{i,t}$), restricted to pairs with imports in month $t$ and renormalized.
+
+```{r groups}
+goods_grp <- function(naics3) {
+  fcase(
+    naics3 %in% c("111", "112"), "111CA", naics3 %in% c("113", "114", "115"), "113FF",
+    naics3 %in% c("311", "312"), "311FT", naics3 %in% c("313", "314"), "313TT",
+    naics3 %in% c("315", "316"), "315AL", naics3 == "336", "336",
+    naics3 %in% c("211", "212", "213", "321", "322", "323", "324", "325", "326", "327",
+                  "331", "332", "333", "334", "335", "337", "339"), naics3,
+    default = NA_character_)
+}
+bea_to_grp <- function(code) fifelse(code %in% c("3361MV", "3364OT"), "336", code)
+
+read_panel_month <- function(d) {
+  stem <- file.path(proc, "trade_panel",
+                    sprintf("trade_%s_%02d", format(d, "%Y"), as.integer(format(d, "%m"))))
+  cols <- c("hs10", "cty_code", "value", "duty", "naics3", "use_in_industry_agg")
+  if (file.exists(paste0(stem, ".parquet"))) {
+    x <- as.data.table(arrow::read_parquet(paste0(stem, ".parquet")))[, ..cols]
+  } else if (file.exists(paste0(stem, ".csv.gz"))) {
+    x <- fread(paste0(stem, ".csv.gz"), select = cols,
+               colClasses = list(character = c("hs10", "cty_code", "naics3")))
+  } else stop("Missing trade panel file: ", stem)
+  x <- x[use_in_industry_agg == TRUE]
+  x[, grp := goods_grp(naics3)]
+  x[!is.na(grp), .(hs10, cty_code, grp, value, duty)]
+}
+
+months_all <- seq(first_month, last_month, by = "month")
+months_24  <- months_all[format(months_all, "%Y") == "2024"]
+
+# 2024 pair weights (hs10 x country)
+w24 <- rbindlist(lapply(months_24, function(d) read_panel_month(d)[, .(m24 = sum(value)), by = .(hs10, cty_code, grp)]))
+w24 <- w24[, .(m24 = sum(m24)), by = .(hs10, cty_code, grp)][m24 > 0]
+m_grp24 <- w24[, .(m_g = sum(m24)), by = grp]   # 2024 imports by group, dollars
+
+tau_month <- function(d) {
+  x <- read_panel_month(d)[value > 0]
+  x[, tau := pmin(duty / value, tau_cap)]
+  x[, grp := NULL]
+  x <- w24[x, on = c("hs10", "cty_code"), nomatch = 0]
+  r <- x[, .(num = sum(m24 * tau), den = sum(m24), n_pairs = .N), by = grp]
+  r[, `:=`(tau = 100 * num / den, date = d)]
+  r[, .(grp, date, tau, den, n_pairs)]
+}
+tau_dt <- rbindlist(lapply(months_all, tau_month))
+tau_dt <- merge(tau_dt, m_grp24, by = "grp")
+tau_dt[, coverage := den / m_g]          # share of 2024 import weight observed in month t
+setorder(tau_dt, grp, date)
+tau_dt[, dtau := tau - shift(tau), by = grp]   # monthly change in percentage points
+cat("Weight coverage by month (median across groups):\n")
+print(tau_dt[, .(median_coverage = round(median(coverage), 3)), by = date][, summary(median_coverage)])
+```
+
+## 2.1 Validation against AT2026 Table 2
+
+Our fixed-weight industry tariffs against AT2026's average realized tariffs (their
+Table 2, single-NAICS industries). Differences arise because they weight by date-$t$ imports.
+
+```{r table2}
+paper <- data.table(
+  grp = c("321","322","323","324","325","326","327","331","332","333","334","335","336","337","339"),
+  paper_2024 = c(2.20,2.30,2.13,0.41,0.99,4.85,5.63,1.76,5.87,2.69,0.81,4.48,1.76,5.83,1.73),
+  paper_2025 = c(6.01,7.5,5.96,0.41,2.86,13.83,14.28,9.37,22.79,12.26,3.28,13.90,11.34,16.24,11.12))
+ours <- tau_dt[, .(ours_2024 = mean(tau[format(date, "%Y") == "2024"]),
+                   ours_2025 = mean(tau[format(date, "%Y") == "2025"])), by = grp]
+cmp <- merge(paper, ours, by = "grp")
+cmp[, (c("ours_2024", "ours_2025")) := lapply(.SD, round, 2), .SDcols = c("ours_2024", "ours_2025")]
+cmp
+```
+
+# 3. Industry exposure: IP and RIC
+
+$$
+IP_{g,t}=\frac{m_{g,24}\,\Delta\tau_{g,t}}{Q_g+m_g-x_g},\qquad
+RIC_{i,t}=\sum_h S_{ih}\,IP_{h,t},\qquad S_{ih}=\frac{u_{ih}}{\iota_i+\omega_i}.
+$$
+
+$Q_g$ is BEA industry output (`T018`), $x_g$ BEA exports (`F040`), $m_g$ 2024 customs imports.
+$\Delta\tau$ is the **monthly** change in percentage points (AT2026 use 12-month changes;
+the 12-month change is the sum of twelve of these).
+
+```{r exposure}
+grp_of_ind <- bea_to_grp(ind_codes)
+absorp <- data.table(grp = sort(unique(tau_dt$grp)))
+stopifnot(all(absorp$grp %in% grp_of_ind))
+absorp[, Q := vapply(grp, function(g) sum(Qout[grp_of_ind == g]), numeric(1))]
+absorp[, x := vapply(grp, function(g) sum(Xexp[bea_to_grp(names(Xexp)) == g]), numeric(1))]
+absorp <- merge(absorp, m_grp24[, .(grp, m = m_g / 1e6)], by = "grp", all.x = TRUE)   # millions
+absorp[is.na(m), m := 0]
+absorp[, A := Q + m - x]
+absorp[, import_share := m / A]
+stopifnot(all(absorp$A > 0))
+absorp[order(-import_share)]   # sanity check: import penetration by industry
+```
+
+```{r exposure2}
+ip_g <- merge(tau_dt[, .(grp, date, dtau)], absorp[, .(grp, m, A)], by = "grp")
+ip_g[, IP := (m / A) * dtau]
+ip_g[date == first_month, IP := 0]                    # no change defined in the first month
+ip_g[is.na(IP), IP := 0]
+
+dates_shock <- months_all[-1]                          # months with a defined change
+ipw <- dcast(ip_g[date %in% dates_shock], grp ~ date, value.var = "IP", fill = 0)
+IPmat_g <- as.matrix(ipw[, -1, with = FALSE]); rownames(IPmat_g) <- ipw$grp
+
+# IP for every BEA commodity h (zero for non-goods commodities)
+IPmat_h <- matrix(0, nrow = length(com_rows), ncol = length(dates_shock),
+                  dimnames = list(com_rows, as.character(dates_shock)))
+for (h in com_rows) {
+  g <- bea_to_grp(h)
+  if (g %in% rownames(IPmat_g)) IPmat_h[h, ] <- IPmat_g[g, ]
+}
+RICmat_i <- t(S) %*% IPmat_h                            # BEA industry x date
+colnames(RICmat_i) <- as.character(dates_shock)
+
+# Pseudo-industries for QCEW NAICS-3 codes that BEA splits (output-weighted)
+wavg <- function(codes) {
+  w <- Qout[codes] / sum(Qout[codes]); drop(t(w) %*% RICmat_i[codes, , drop = FALSE])
+}
+RICmat_i <- rbind(RICmat_i, "336" = wavg(c("3361MV", "3364OT")), "541" = wavg(c("5411", "5415", "5412OP")))
+IPind <- function(code) {                                # IP by BEA industry code (+pseudo 336)
+  g <- bea_to_grp(code)
+  if (g %in% rownames(IPmat_g)) IPmat_g[g, ] else rep(0, length(dates_shock))
+}
+```
+
+# 4. County exposure from QCEW 2024 shares
+
+QCEW 2024: $N_{ic}$ = private NAICS-3 employment, $N_c$ = county total covered employment.
+Suppressed (`N`) industry cells are treated as **zero** employment (this attenuates exposure
+in small counties; see the QA summary of `03_build_qcew_county.py`).
+
+The NAICS-3 -> BEA crosswalk below covers both NAICS 2017 and NAICS 2022 3-digit codes (QCEW uses
+2022 NAICS from 2022; BEA uses 2017). Review it if the chunk reports unmapped employment.
+
+```{r qcew}
+xw <- rbindlist(list(
+  data.table(naics3 = c("111","112"), bea = "111CA"),
+  data.table(naics3 = c("113","114","115"), bea = "113FF"),
+  data.table(naics3 = c("211","212","213"), bea = c("211","212","213")),
+  data.table(naics3 = "221", bea = "22"),
+  data.table(naics3 = c("236","237","238"), bea = "23"),
+  data.table(naics3 = c("311","312"), bea = "311FT"),
+  data.table(naics3 = c("313","314"), bea = "313TT"),
+  data.table(naics3 = c("315","316"), bea = "315AL"),
+  data.table(naics3 = c("321","322","323","324","325","326","327","331","332","333","334","335","337","339"),
+             bea = c("321","322","323","324","325","326","327","331","332","333","334","335","337","339")),
+  data.table(naics3 = "336", bea = "336"),
+  data.table(naics3 = c("423","424","425"), bea = "42"),
+  data.table(naics3 = c("441"), bea = "441"),
+  data.table(naics3 = c("445"), bea = "445"),
+  data.table(naics3 = c("452","455"), bea = "452"),
+  data.table(naics3 = c("442","443","444","446","447","448","449","451","453","454","456","457","458","459"), bea = "4A0"),
+  data.table(naics3 = c("481","482","483","484","485","486","493"), bea = c("481","482","483","484","485","486","493")),
+  data.table(naics3 = c("487","488","492"), bea = "487OS"),
+  data.table(naics3 = c("511","513"), bea = "511"),
+  data.table(naics3 = "512", bea = "512"),
+  data.table(naics3 = c("515","516","517"), bea = "513"),
+  data.table(naics3 = c("518","519"), bea = "514"),
+  data.table(naics3 = c("521","522"), bea = "521CI"),
+  data.table(naics3 = c("523","524","525"), bea = c("523","524","525")),
+  data.table(naics3 = "531", bea = "ORE"),
+  data.table(naics3 = c("532","533"), bea = "532RL"),
+  data.table(naics3 = "541", bea = "541"),
+  data.table(naics3 = "551", bea = "55"),
+  data.table(naics3 = c("561","562"), bea = c("561","562")),
+  data.table(naics3 = "611", bea = "61"),
+  data.table(naics3 = c("621","622","623","624"), bea = c("621","622","623","624")),
+  data.table(naics3 = c("711","712"), bea = "711AS"),
+  data.table(naics3 = "713", bea = "713"),
+  data.table(naics3 = c("721","722"), bea = c("721","722")),
+  data.table(naics3 = c("811","812","813","814"), bea = "81")))
+stopifnot(!anyDuplicated(xw$naics3))
+
+qpath <- c(file.path(proc, sprintf("qcew_county_industry_%d.parquet", 2024)),
+           file.path(proc, sprintf("qcew_county_industry_%d.csv.gz", 2024)))
+qpath <- qpath[file.exists(qpath)][1]
+q <- if (grepl("parquet$", qpath)) as.data.table(arrow::read_parquet(qpath)) else
+  fread(qpath, colClasses = list(character = c("area_fips", "agglvl_code", "own_code", "industry_code")))
+q[, `:=`(area_fips = as.character(area_fips), agglvl_code = as.character(agglvl_code),
+         own_code = as.character(own_code), industry_code = as.character(industry_code))]
+
+Nc  <- q[agglvl_code == "70" & own_code == "0", .(fips = area_fips, N_c = emp_avg)]
+shr <- q[agglvl_code == "75" & own_code == "5", .(fips = area_fips, naics3 = industry_code, emp = fifelse(is.na(emp_avg), 0, emp_avg))]
+shr <- merge(shr, Nc, by = "fips")[N_c > 0]
+shr[, share := emp / N_c]
+
+unm <- shr[!naics3 %in% xw$naics3, .(emp = sum(emp)), by = naics3][order(-emp)]
+cat(sprintf("Employment in unmapped NAICS-3 codes: %.2f%% of mapped+unmapped private employment\n",
+            100 * sum(unm$emp) / sum(shr$emp)))
+print(head(unm, 10))
+shr <- merge(shr, xw, by = "naics3")
+```
+
+```{r county_exposure}
+# Industry x date exposure table at the QCEW NAICS-3 level
+exp_bea <- rbindlist(lapply(unique(xw$bea), function(b) {
+  ric <- if (b %in% rownames(RICmat_i)) RICmat_i[b, ] else rep(0, length(dates_shock))
+  data.table(bea = b, date = dates_shock, dIP = IPind(b), dRIC = ric)
+}))
+ind_exp <- merge(xw, exp_bea, by = "bea", allow.cartesian = TRUE)
+
+ce <- merge(shr[, .(fips, naics3, share)], ind_exp[, .(naics3, date, dIP, dRIC)],
+            by = "naics3", allow.cartesian = TRUE)
+ce <- ce[, .(dIP = sum(share * dIP), dRIC = sum(share * dRIC)), by = .(fips, date)]
+fwrite(ce, file.path(proc, "county_exposure_monthly.csv.gz"))
+# industry-level exposure, so 06_robustness.Rmd can re-aggregate with other employment shares
+fwrite(ind_exp[, .(naics3, bea, date, dIP, dRIC)], file.path(proc, "industry_exposure_monthly.csv.gz"))
+cat(uniqueN(ce$fips), "counties with exposure;", length(dates_shock), "months\n")
+```
+
+## 4.1 Validation: 12-month change in Local IP and RIC (AT2026 Figure 12)
+
+Compare the shape and level of these series by eye with AT2026 Figure 12.
+
+```{r fig12, fig.height=4}
+ce12 <- copy(ce); setorder(ce12, fips, date)
+ce12[, `:=`(IP12 = frollsum(dIP, 12), RIC12 = frollsum(dRIC, 12)), by = fips]
+f12 <- ce12[!is.na(IP12), .(`Local IP` = mean(IP12), `Local RIC` = mean(RIC12)), by = date]
+f12 <- melt(f12, id.vars = "date")
+ggplot(f12, aes(date, value, linetype = variable)) + geom_line(linewidth = 0.9) +
+  labs(title = "Local IP and RIC, 12-month change (county mean)", x = NULL, y = "percentage points", linetype = NULL) +
+  theme_minimal(base_size = 12)
+ggsave(file.path(figd, "fig_local_ip_ric_12m.png"), width = 9, height = 4.5, dpi = 150)
+```
+
+# 5. Estimation panel
+
+```{r panel}
+laus <- fread(file.path(proc, "laus_county_unemployment.csv"),
+              colClasses = list(character = c("fips", "state_fips")))
+laus[, date := as.Date(date)]
+setorder(laus, fips, date)
+laus[, d12_u := unemp_rate - shift(unemp_rate, 12), by = fips]   # 12-month change (AT2026 outcome basis, in levels)
+
+# complete date grid with zero shocks before the first customs month (tariffs flat before 2024)
+grid_dates <- seq(as.Date("2023-01-01"), last_month, by = "month")
+Z <- CJ(fips = unique(ce$fips), date = grid_dates)
+Z <- merge(Z, ce, by = c("fips", "date"), all.x = TRUE)
+Z[is.na(dIP), dIP := 0]; Z[is.na(dRIC), dRIC := 0]
+setorder(Z, fips, date)
+
+tag <- function(m) ifelse(m < 0, paste0("f", abs(m)), paste0("l", m))
+for (m in -G:M) {
+  Z[, paste0("IP_", tag(m))  := shift(dIP,  n = m, type = "lag"), by = fips]
+  Z[, paste0("RIC_", tag(m)) := shift(dRIC, n = m, type = "lag"), by = fips]
+}
+ip_terms  <- paste0("IP_",  tag(-G:M))
+ric_terms <- paste0("RIC_", tag(-G:M))
+
+dat <- merge(Z[date >= est_start & date <= est_end], laus[, .(fips, date, unemp_rate, d12_u)], by = c("fips", "date"))
+dat <- merge(dat, Nc, by.x = "fips", by.y = "fips")
+dat[, `:=`(state = substr(fips, 1, 2), cal_month = month(date))]
+cat(nrow(dat), "county-month rows;", uniqueN(dat$fips), "counties;",
+    sum(is.na(dat$unemp_rate)), "rows with missing outcome (October 2025)\n")
+```
+
+# 6. Distributed-lag event study
+
+```{r fit}
+run_dl <- function(y, fe, wt = NULL, data = dat) {
+  fml <- as.formula(paste0(y, " ~ ", paste(c(ip_terms, ric_terms), collapse = " + "), " | ", fe))
+  f <- feols(fml, data = data, cluster = ~state, weights = wt)
+  dropped <- setdiff(c(ip_terms, ric_terms), names(coef(f)))
+  if (length(dropped)) stop("Collinear terms dropped: ", paste(dropped, collapse = ", "),
+                            ". Reduce G or M, or shorten the lag window.")
+  f
+}
+fits <- list(
+  "Baseline: county x month FE"          = run_dl("unemp_rate", "fips^cal_month + date"),
+  "Employment-weighted"                  = run_dl("unemp_rate", "fips^cal_month + date", wt = ~N_c),
+  "12-month-change outcome (AT2026)"     = run_dl("d12_u", "fips + date"))
+etable(fits, keep = c("IP_f1", "IP_l0", "IP_l3", "RIC_f1", "RIC_l0", "RIC_l3"), fitstat = ~ n + r2)
+```
+
+```{r cum}
+cum_effects <- function(fit, prefix) {
+  ms <- -G:M
+  nm <- paste0(prefix, "_", tag(ms))
+  b <- coef(fit)[nm]; V <- vcov(fit)[nm, nm]
+  res <- rbindlist(lapply(seq_along(ms), function(j) {
+    a <- as.numeric(seq_along(ms) <= j)
+    data.table(k = ms[j], est = sum(a * b), se = sqrt(drop(t(a) %*% V %*% a)))
+  }))
+  rbind(data.table(k = -G - 1, est = 0, se = 0), res)         # delta_k = 0 for k < -G
+}
+cum <- rbindlist(lapply(names(fits), function(s)
+  rbind(cum_effects(fits[[s]], "IP")[, exposure := "Import protection (IP)"],
+        cum_effects(fits[[s]], "RIC")[, exposure := "Rising input costs (RIC)"])[, spec := s]))
+cum[, `:=`(lo = est - 1.96 * se, hi = est + 1.96 * se)]
+
+ggplot(cum[spec == names(fits)[1]], aes(k, est)) +
+  geom_hline(yintercept = 0, colour = "grey50") +
+  geom_vline(xintercept = -0.5, linetype = "dashed", colour = "grey50") +
+  geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.2) + geom_line(linewidth = 0.9) + geom_point(size = 1.6) +
+  facet_wrap(~exposure, scales = "free_y") +
+  labs(title = "Cumulative effect on the county unemployment rate",
+       subtitle = "delta_k per unit of exposure; 95% CI, state-clustered. Baseline: county x month FE",
+       x = "Months since exposure change (k)", y = "percentage points") +
+  theme_minimal(base_size = 12)
+ggsave(file.path(figd, "fig_cumulative_effects.png"), width = 9, height = 4.8, dpi = 150)
+
+ggplot(cum, aes(k, est, colour = spec, fill = spec)) +
+  geom_hline(yintercept = 0, colour = "grey50") +
+  geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.10, colour = NA) + geom_line(linewidth = 0.8) +
+  facet_wrap(~exposure, scales = "free_y") +
+  labs(title = "Cumulative effects across specifications", x = "Months since exposure change (k)",
+       y = "percentage points", colour = NULL, fill = NULL) +
+  theme_minimal(base_size = 12) + theme(legend.position = "bottom")
+ggsave(file.path(figd, "fig_cumulative_effects_specs.png"), width = 9, height = 5, dpi = 150)
+```
+
+## 6.1 Pre-trend tests
+
+Joint Wald test that all lead coefficients are zero (equivalently $\delta_k=0$ for $-G\le k\le -1$).
+
+```{r pretrend}
+wald_leads <- function(fit, prefix) {
+  nm <- paste0(prefix, "_f", G:1)
+  b <- coef(fit)[nm]; V <- vcov(fit)[nm, nm]
+  W <- drop(t(b) %*% solve(V) %*% b)
+  data.table(chi2 = round(W, 2), df = length(nm), p_value = round(pchisq(W, length(nm), lower.tail = FALSE), 3))
+}
+pt <- rbindlist(lapply(names(fits), function(s)
+  rbind(wald_leads(fits[[s]], "IP")[, exposure := "IP"], wald_leads(fits[[s]], "RIC")[, exposure := "RIC"])[, spec := s]))
+pt[, .(spec, exposure, chi2, df, p_value)]
+```
+
+# 7. Counterfactual: no-tariff unemployment
+
+The tariff contribution to unemployment is the post-change part of the fitted index,
+$$
+\widehat{TE}_{c,t}=\sum_{m=0}^{M}\big(\hat\beta^{IP}_m\,\Delta IP_{c,t-m}+\hat\beta^{RIC}_m\,\Delta RIC_{c,t-m}\big),
+$$
+and the counterfactual (no-tariff) rate is $\hat u_{c,t}=u_{c,t}-\widehat{TE}_{c,t}$ (leads are excluded
+from $TE$: they test pre-trends and should not be treated as an effect).
+
+```{r cf}
+fit0 <- fits[[1]]
+cols_ip  <- paste0("IP_",  tag(0:M)); cols_ric <- paste0("RIC_", tag(0:M))
+dat[, TE_IP  := drop(as.matrix(.SD) %*% coef(fit0)[cols_ip]),  .SDcols = cols_ip]
+dat[, TE_RIC := drop(as.matrix(.SD) %*% coef(fit0)[cols_ric]), .SDcols = cols_ric]
+dat[, `:=`(TE = TE_IP + TE_RIC, u_cf = unemp_rate - (TE_IP + TE_RIC))]
+
+wtd <- function(x, w) sum(x * w, na.rm = TRUE) / sum(w[!is.na(x)])
+nat <- dat[!is.na(unemp_rate), .(Observed = wtd(unemp_rate, N_c),
+                                  `Counterfactual (no tariff effect)` = wtd(u_cf, N_c),
+                                  TE = wtd(TE, N_c), TE_IP = wtd(TE_IP, N_c), TE_RIC = wtd(TE_RIC, N_c)), by = date]
+natl <- melt(nat[, .(date, Observed, `Counterfactual (no tariff effect)`)], id.vars = "date")
+ggplot(natl, aes(date, value, colour = variable, linetype = variable)) + geom_line(linewidth = 0.9) +
+  labs(title = "Employment-weighted unemployment rate: observed vs counterfactual",
+       subtitle = "u_hat = u - TE; October 2025 missing in LAUS", x = NULL, y = "percent", colour = NULL, linetype = NULL) +
+  theme_minimal(base_size = 12) + theme(legend.position = "bottom")
+ggsave(file.path(figd, "fig_counterfactual_national.png"), width = 9, height = 4.8, dpi = 150)
+
+nat[, .(date, TE = round(TE, 4), TE_IP = round(TE_IP, 4), TE_RIC = round(TE_RIC, 4))]
+```
+
+```{r cf_quartile}
+# Quartiles of exposure: county average predicted IP contribution (employment-weighted cut-offs)
+wq <- function(x, w, probs) { o <- order(x); cw <- cumsum(w[o]) / sum(w); x[o][vapply(probs, function(p) which(cw >= p)[1], 1L)] }
+cty <- dat[, .(TE_IP_avg = mean(TE_IP), N_c = first(N_c)), by = fips]
+cuts <- wq(cty$TE_IP_avg, cty$N_c, c(0.25, 0.75))
+cty[, grp := fifelse(TE_IP_avg <= cuts[1], "Low IP exposure (bottom 25%)",
+                     fifelse(TE_IP_avg >= cuts[2], "High IP exposure (top 25%)", NA_character_))]
+byq <- merge(dat, cty[!is.na(grp), .(fips, grp)], by = "fips")[!is.na(unemp_rate),
+              .(TE = wtd(TE, N_c), Observed = wtd(unemp_rate, N_c)), by = .(grp, date)]
+ggplot(byq, aes(date, TE, colour = grp)) + geom_hline(yintercept = 0, colour = "grey60") +
+  geom_line(linewidth = 0.9) +
+  labs(title = "Predicted tariff contribution to unemployment, by IP exposure", x = NULL,
+       y = "percentage points (TE)", colour = NULL) +
+  theme_minimal(base_size = 12) + theme(legend.position = "bottom")
+ggsave(file.path(figd, "fig_te_by_ip_quartile.png"), width = 9, height = 4.8, dpi = 150)
+```
+
+# 8. Notes and limitations
+
+* **Shock timing.** Customs data begin January 2024; tariff changes before February 2024 are set to zero.
+  Outcomes end `r format(est_end, "%B %Y")` so every lead has an observed shock.
+* **October 2025.** LAUS county unemployment is missing for every county (federal shutdown); rows are dropped by the estimator.
+* **Seasonality.** Baseline uses county x calendar-month FE; with about two observations per cell this is
+  close to a year-over-year comparison and is compared against the 12-month-change specification above.
+* **Suppression.** QCEW-suppressed industry cells enter as zero employment.
+* **Unmapped industries.** Review the NAICS-3 -> BEA crosswalk in section 4 if employment is reported as unmapped.
+* **Fixed-weight tariffs.** Pairs with no imports in month $t$ drop out and weights are renormalized; coverage is reported in section 2.
+* **Not yet done:** trimming the top 1% of exposure, shift-share-robust standard errors, instrumenting realized
+  with statutory exposure, and the 2023 base-year check.

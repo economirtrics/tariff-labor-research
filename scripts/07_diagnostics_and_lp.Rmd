@@ -1,0 +1,351 @@
+---
+title: "Diagnostics: is the null result real?"
+subtitle: "Specification audit, local projections, and a power analysis"
+author: "Amir Azlan, University of Illinois Urbana-Champaign"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: paged
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 9, fig.height = 4.8, dpi = 110)
+library(data.table); library(ggplot2); library(fixest)
+
+find_root <- function(start = getwd()) {
+  p <- normalizePath(start)
+  while (!dir.exists(file.path(p, "data", "processed")) && dirname(p) != p) p <- dirname(p)
+  p
+}
+root <- find_root()
+proc <- file.path(root, "data", "processed")
+figd <- file.path(root, "output", "figures"); dir.create(figd, recursive = TRUE, showWarnings = FALSE)
+knitr::opts_knit$set(root.dir = root)
+```
+
+The distributed-lag results in `05` and `06` show no significant effect of either exposure
+channel on county unemployment, with very wide confidence bands. This file asks whether that
+is a property of the data or an artefact of the specification. It finds that the cumulation
+step in `05` is invalid for a monthly-change regressor, tries local projections as a fix, and
+finds that those fail a stability test as well (section 5). The specification that fits this
+shock is in `08_event_study_levels.Rmd`.
+
+# 0. The problem with cumulating a flow regressor
+
+`05` estimates
+
+$$u_{c,t}=\alpha_{c,\text{month}}+\gamma_t+\sum_{m=-G}^{M}\beta_m\,\Delta IP_{c,t-m}+\dots$$
+
+and reports $\delta_k=\sum_{m=-G}^{k}\beta_m$ as "the cumulative effect of a permanent unit
+increase in exposure." That identity holds when the regressor is the **level** of treatment
+(Schmidheiny & Siegloch). Our regressor is the monthly **change**, so the response to a
+one-time permanent tariff increase is $\beta_k$ itself, and cumulating it describes a
+different experiment: exposure rising by one unit *every month, forever*.
+
+```{r demo}
+# Synthetic check: permanent exposure step of 5 at t=0; true effect 0.1 per unit, arriving at h=3.
+Zlev <- c(rep(0, 6), rep(5, 18))                 # exposure level
+dZ   <- c(0, diff(Zlev))                          # flow: a single spike
+u    <- 0.1 * shift(Zlev, 3, fill = 0)            # truth: flat at 0.5 from h=3 onward
+data.table(h = -3:5, exposure_level = Zlev[4:12], exposure_flow = dZ[4:12],
+           true_effect = u[4:12])
+```
+
+Fitting the flow specification to this data recovers $\beta_3=\beta_4=\dots=0.1$, which is
+correct. Cumulating gives $0.1, 0.2, 0.3,\dots$ — a linear climb where the truth is flat.
+The RIC panel in `05` has exactly that shape, and its confidence band widens with $k$ because
+the variance of a 13-term sum accumulates. Both are expected artefacts.
+
+**Second problem.** The tariff shock is close to a single event (spring 2025) inside a
+24-month window. The lags of a one-time spike are near-collinear by construction, date fixed
+effects absorb the common time path, and 26 coefficients are asked of cross-county
+composition differences alone. Section 3 quantifies how little independent variation remains.
+
+**A first attempt at a fix** is one regression per horizon with a single shock term: local
+projections. Section 5 tests whether that is enough.
+
+# 1. Rebuild the panel, with exposure in levels as well as flows
+
+```{r panel}
+G <- 6; M <- 9        # six placebo horizons; two is too thin to rest a result on
+base_year  <- 2024
+est_start  <- as.Date("2024-01-01")
+last_month <- as.Date("2026-03-01")
+
+ce <- fread(file.path(proc, "county_exposure_monthly.csv.gz"), colClasses = list(character = "fips"))
+ce[, date := as.Date(date)]
+
+laus <- fread(file.path(proc, "laus_county_unemployment.csv"),
+              colClasses = list(character = c("fips", "state_fips")))
+laus[, date := as.Date(date)]; setorder(laus, fips, date)
+
+qpath <- c(file.path(proc, sprintf("qcew_county_industry_%d.parquet", base_year)),
+           file.path(proc, sprintf("qcew_county_industry_%d.csv.gz", base_year)))
+qpath <- qpath[file.exists(qpath)][1]
+q <- if (grepl("parquet$", qpath)) as.data.table(arrow::read_parquet(qpath)) else
+  fread(qpath, colClasses = list(character = c("area_fips", "agglvl_code", "own_code")))
+q[, `:=`(area_fips = as.character(area_fips), agglvl_code = as.character(agglvl_code),
+         own_code = as.character(own_code))]
+Nc <- q[agglvl_code == "70" & own_code == "0", .(fips = area_fips, N_c = emp_avg)]
+
+# Exposure ends with the customs panel (March 2026), but LAUS runs to September 2026.
+# Extending the grid to the end of LAUS keeps the long-horizon outcomes that would
+# otherwise be dropped: at h = 9, shocks were previously usable only through June 2025.
+# Tariff changes are treated as zero after the customs panel ends - an assumption, and
+# the reason shock months are capped at last_month in run_lp below.
+outcome_end <- max(laus$date)
+grid_dates <- seq(as.Date("2023-01-01"), outcome_end, by = "month")
+P <- CJ(fips = unique(ce$fips), date = grid_dates)
+P <- merge(P, ce, by = c("fips", "date"), all.x = TRUE)
+P[is.na(dIP), dIP := 0]; P[is.na(dRIC), dRIC := 0]
+setorder(P, fips, date)
+
+# LEVEL of cumulative exposure (the analogue of AT2026's Local IP / Local RIC)
+P[, `:=`(IP_lvl = cumsum(dIP), RIC_lvl = cumsum(dRIC)), by = fips]
+
+P <- merge(P, laus[, .(fips, date, unemp_rate)], by = c("fips", "date"), all.x = TRUE)
+P <- merge(P, Nc, by = "fips")
+P[, `:=`(state = substr(fips, 1, 2), cal_month = month(date))]
+setorder(P, fips, date)
+
+cat(sprintf("Panel: %s rows, %s counties, %s to %s\n", format(nrow(P), big.mark = ","),
+            format(uniqueN(P$fips), big.mark = ","), min(P$date), max(P$date)))
+```
+
+# 2. Local projections
+
+For each horizon $h$,
+
+$$u_{c,t+h}-u_{c,t-1}=\alpha_c+\gamma_t+\theta^{IP}_h\,\Delta IP_{c,t}+\theta^{RIC}_h\,\Delta RIC_{c,t}+\sum_{l=1}^{L}\text{controls}_{c,t-l}+e_{c,t,h}$$
+
+$\theta_h$ **is** the effect at horizon $h$ — no cumulation. Negative $h$ are placebo horizons
+and test pre-trends. Each horizon is its own regression, so the lag terms never compete with
+one another for identification.
+
+```{r lp}
+L_CTRL <- 3   # control lags
+
+for (l in 1:L_CTRL) {
+  P[, paste0("dIP_l",  l) := shift(dIP,  l), by = fips]
+  P[, paste0("dRIC_l", l) := shift(dRIC, l), by = fips]
+}
+# lagged outcome changes, built deep enough for the shifted placebo controls below
+for (l in 1:(G + L_CTRL)) {
+  P[, paste0("du_l", l) := shift(unemp_rate, l) - shift(unemp_rate, l + 1), by = fips]
+}
+
+# Controls must not span the outcome. For a placebo horizon h < -1,
+#   y_h = u_{t+h} - u_{t-1} = -(du_l1 + ... + du_l{|h|-1}),
+# so the default du_l1..3 contain the dependent variable exactly: R^2 = 1 and the
+# coefficients are numerical noise. For those horizons the du lags start beyond
+# the outcome window instead.
+ctrl_for <- function(h) {
+  start <- if (h < -1) abs(h) else 1
+  c(paste0("dIP_l", 1:L_CTRL), paste0("dRIC_l", 1:L_CTRL),
+    paste0("du_l", start:(start + L_CTRL - 1)))
+}
+
+# h = -1 is the normalization period: y_h would be u_{t-1} - u_{t-1} = 0 for every row,
+# so it is skipped here and added back as an explicit zero reference when plotting.
+run_lp <- function(data, hs = setdiff(-G:M, -1), yvar = "unemp_rate", wt = NULL,
+                   label = "Local projection") {
+  rbindlist(lapply(hs, function(h) {
+    d <- copy(data)
+    d[, y_h := shift(get(yvar), n = -h, type = "lag") - shift(get(yvar), 1), by = fips]
+    # shock months must lie inside the customs panel; outcomes may run past it
+    d <- d[date >= est_start & date <= last_month & !is.na(y_h)]
+    f <- feols(as.formula(paste("y_h ~ dIP + dRIC +", paste(ctrl_for(h), collapse = " + "),
+                                "| fips + date")),
+               data = d, cluster = ~state, weights = wt)
+    # R^2 at or near 1 means the outcome is spanned by the controls: the horizon is degenerate
+    if (r2(f, "r2") > 0.999)
+      warning("Horizon ", h, ": R2 = ", signif(r2(f, "r2"), 6),
+              " - dependent variable is spanned by the controls.", call. = FALSE)
+    rbindlist(lapply(c("dIP", "dRIC"), function(v) data.table(
+      h = h, exposure = fifelse(v == "dIP", "Import protection (IP)", "Rising input costs (RIC)"),
+      est = coef(f)[v], se = se(f)[v], n = nobs(f), r2 = r2(f, "r2"), spec = label)))
+  }))
+}
+
+lp <- run_lp(P)
+lp[, `:=`(lo = est - 1.96 * se, hi = est + 1.96 * se)]
+# add h = -1 back as the zero reference point
+ref <- unique(lp[, .(exposure, spec)])[, `:=`(h = -1, est = 0, se = 0, lo = 0, hi = 0)]
+lp <- rbind(lp, ref, use.names = TRUE, fill = TRUE)
+setorder(lp, exposure, h)
+
+ggplot(lp, aes(h, est)) +
+  geom_hline(yintercept = 0, colour = "grey50") +
+  geom_vline(xintercept = -0.5, linetype = "dashed", colour = "grey60") +
+  geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.2) +
+  geom_line(linewidth = 0.9) + geom_point(size = 1.6) +
+  facet_wrap(~exposure, scales = "free_y") +
+  labs(title = "Local projection: effect on the county unemployment rate",
+       subtitle = "theta_h per unit of exposure; 95% CI, state-clustered. h < 0 are placebo horizons",
+       x = "Months since exposure change (h)", y = "percentage points") +
+  theme_minimal(base_size = 12)
+ggsave(file.path(figd, "diag_fig_local_projection.png"), width = 9, height = 4.8, dpi = 150)
+```
+
+```{r lp_pretrend}
+# placebo horizons only; h = -1 is the reference and is zero by construction.
+# r2 should look like the post-period horizons; a value near 1 means the horizon is degenerate.
+lp[h < -1, .(exposure, h, est = signif(est, 3), se = signif(se, 3),
+             t = round(est / se, 2), r2 = round(r2, 4), n)][order(exposure, h)]
+```
+
+# 3. How much variation survives the fixed effects?
+
+The coefficient is identified only by exposure variation left after the fixed effects are
+removed. If that residual variation is near zero, no specification can detect anything.
+
+```{r variation}
+vd <- P[date >= est_start & date <= as.Date("2025-12-01")]
+aux_ip  <- feols(dIP  ~ 1 | fips + date, data = vd)
+aux_ric <- feols(dRIC ~ 1 | fips + date, data = vd)
+
+varn <- data.table(
+  measure   = c("dIP", "dRIC"),
+  sd_raw    = c(sd(vd$dIP), sd(vd$dRIC)),
+  sd_within = c(sd(resid(aux_ip)), sd(resid(aux_ric))))
+varn[, share_surviving := round(sd_within / sd_raw, 3)]
+varn[, (c("sd_raw", "sd_within")) := lapply(.SD, signif, 3), .SDcols = c("sd_raw", "sd_within")]
+varn
+
+# cross-sectional spread in cumulative exposure at the end of the sample
+end <- P[date == as.Date("2025-12-01")]
+data.table(measure = c("IP level", "RIC level"),
+           p10 = c(quantile(end$IP_lvl, .10), quantile(end$RIC_lvl, .10)),
+           p50 = c(median(end$IP_lvl), median(end$RIC_lvl)),
+           p90 = c(quantile(end$IP_lvl, .90), quantile(end$RIC_lvl, .90)),
+           p90_minus_p10 = c(diff(quantile(end$IP_lvl, c(.10, .90))),
+                             diff(quantile(end$RIC_lvl, c(.10, .90)))))
+```
+
+# 4. Minimum detectable effect
+
+A null is only informative if the design could have found an effect of plausible size. For
+80% power at the 5% level, the smallest detectable coefficient is about $2.8\times SE$. We
+translate that into something interpretable: the unemployment effect of moving a county from
+the 10th to the 90th percentile of exposure.
+
+```{r mde}
+spread <- c(IP = diff(quantile(end$IP_lvl, c(.10, .90))),
+            RIC = diff(quantile(end$RIC_lvl, c(.10, .90))))
+
+mde <- lp[h == M, .(exposure, est, se)]
+mde[, channel := fifelse(grepl("Import", exposure), "IP", "RIC")]
+mde[, mde_coef := 2.8 * se]
+mde[, spread_p10_p90 := spread[channel]]
+mde[, mde_pp := mde_coef * spread_p10_p90]
+mde[, observed_pp := est * spread_p10_p90]
+mde[, .(exposure,
+        `estimate (pp per unit)` = round(est, 3),
+        `SE` = round(se, 3),
+        `smallest detectable coef` = round(mde_coef, 3),
+        `= unemployment effect, p10->p90 (pp)` = round(mde_pp, 3),
+        `observed effect, p10->p90 (pp)` = round(observed_pp, 3))]
+```
+
+Read the fourth column as: *we could only have rejected the null if the tariff shock moved a
+high-exposure county's unemployment rate by at least this many percentage points, relative to
+a low-exposure county.* Compare it to what a plausible tariff effect would be (AT2026 describe
+their own effects as small). If the detectable threshold is far larger than any plausible
+effect, the null means "underpowered," not "no effect" — and that is the honest finding to
+report.
+
+# 5. Positive control: can the design recover an effect that is really there?
+
+This is the decisive test of whether the pipeline works. We inject a known effect into the
+outcome and re-estimate. If the design recovers it, the machinery is sound and the null is
+about the data. If it cannot recover even a large injected effect, the design is the problem.
+
+```{r positive_control}
+betas <- c(0, 0.5, 1, 2, 5, 10)
+pc <- rbindlist(lapply(betas, function(b) {
+  d <- copy(P)
+  d[, u_sim := unemp_rate + b * IP_lvl]        # permanent exposure level raises u by b per unit
+  r <- run_lp(d, hs = M, yvar = "u_sim", label = sprintf("b = %.1f", b))
+  r[grepl("Import", exposure), .(true_b = b, recovered = est, se = se,
+                                 t = est / se, detected = abs(est / se) > 1.96)]
+}))
+pc[, .(true_b, recovered = round(recovered, 3), se = round(se, 3),
+       t = round(t, 2), detected)]
+```
+
+A well-behaved design returns `recovered - recovered[true_b = 0]` close to `true_b`.
+
+**Result (run of November 16, 2026).** The recovered share is stable across injected values
+but depends on the sample window: with outcomes ending March 2026 the design recovered 96.8%
+of the injected effect, and after extending outcomes to September 2026 it recovered 48.2%.
+Nothing else changed. The reason is that monthly tariff changes are serially correlated: a
+county's shock at $t$ predicts its shocks at $t+1,\dots,t+h$, which also fall inside the
+$t-1\to t+h$ outcome window, so $\theta_h$ mixes the effect of the time-$t$ shock with the
+effects of the shocks that follow it. How much it mixes depends on which months are in the
+sample. A coefficient with that property does not have a stable interpretation, so the
+local-projection estimates in section 2 are not used as results.
+
+# 6. Replicating AT2026's static specification
+
+Their equation (3): the 12-month log change in unemployment on the **levels** of Local IP and
+Local RIC, county and month fixed effects, clustered by state. Their Table 5 reports
+IP $=-0.24^{**}$ (0.12) and RIC $=0.11$ (0.12) in the untrimmed sample.
+
+If we reproduce those numbers, our exposure measures match theirs and every difference in
+`05`/`06` is attributable to the dynamic specification. If we do not, the exposure
+construction differs — which would also bear on the Figure 12 scale question.
+
+```{r replicate}
+R <- copy(P)[!is.na(unemp_rate) & unemp_rate > 0]
+setorder(R, fips, date)
+R[, ln_u := log(unemp_rate)]
+R[, d12_ln_u := ln_u - shift(ln_u, 12), by = fips]
+R <- R[date >= as.Date("2024-01-01") & date <= as.Date("2025-12-01") & !is.na(d12_ln_u)]
+
+rep_fits <- list(
+  "Untrimmed" = feols(d12_ln_u ~ IP_lvl + RIC_lvl | fips + date, R, cluster = ~state))
+cut99 <- quantile(R$IP_lvl, 0.99, na.rm = TRUE)
+rep_fits[["Trimmed top 1%"]] <- feols(d12_ln_u ~ IP_lvl + RIC_lvl | fips + date,
+                                      R[IP_lvl < cut99], cluster = ~state)
+etable(rep_fits, fitstat = ~ n + r2)
+```
+
+```{r replicate_compare}
+data.table(
+  term  = c("Local IP", "Local RIC"),
+  paper = c(-0.24, 0.11), paper_se = c(0.12, 0.12),
+  ours  = round(coef(rep_fits[[1]])[c("IP_lvl", "RIC_lvl")], 3),
+  ours_se = round(se(rep_fits[[1]])[c("IP_lvl", "RIC_lvl")], 3))
+```
+
+If `ours` differs from `paper` by roughly the same factor for both terms, that is a units
+difference in the exposure measure (the Figure 12 scale question), not a construction error:
+rescaling a regressor divides the coefficient and its standard error equally and leaves the
+t-statistic unchanged. Compare the t-statistics rather than the coefficients.
+
+# 7. Conclusions
+
+From the run of November 16, 2026:
+
+* **The pipeline and exposure measures are sound.** The static AT2026 specification
+  (section 6) reproduces their t-statistics closely: -1.93 against their -2.0 for Local IP and
+  0.96 against 0.92 for Local RIC. Coefficient magnitudes differ because the exposure
+  measures are scaled differently; t-statistics are unaffected by scale.
+* **Identifying variation exists.** 79% of the variation in monthly IP changes and 48% of
+  that in RIC changes survives county and date fixed effects (section 3).
+* **The cumulated distributed lag of `05` is not valid** for a regressor in monthly changes
+  (section 0), and its wide confidence bands are partly produced by summing thirteen
+  coefficients.
+* **Local projections are not a reliable fix.** Placebo horizons are clean once the
+  lagged-outcome controls are kept from spanning the dependent variable (section 2), but the
+  horizon coefficients do not have a stable interpretation when shocks are serially
+  correlated (section 5).
+* **Why both fail.** The 2025 tariffs are one synchronized shock with continuous intensity.
+  Counties differ in dose and not in timing, so designs built on event-time lags ask for
+  variation the data does not contain.
+* **What is used instead:** fixed county exposure interacted with calendar months, in
+  `08_event_study_levels.Rmd`.

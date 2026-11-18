@@ -1,0 +1,371 @@
+---
+title: "Robustness: cumulative tariff effects on county unemployment"
+subtitle: "Trimming, QCEW suppression, channel separation, and lag-window sensitivity"
+author: "Amir Azlan, University of Illinois Urbana-Champaign"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: paged
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 9, fig.height = 4.8, dpi = 110)
+library(data.table); library(ggplot2); library(fixest)
+
+find_root <- function(start = getwd()) {
+  p <- normalizePath(start)
+  while (!dir.exists(file.path(p, "data", "processed")) && dirname(p) != p) p <- dirname(p)
+  p
+}
+root <- find_root()
+proc <- file.path(root, "data", "processed")
+figd <- file.path(root, "output", "figures"); dir.create(figd, recursive = TRUE, showWarnings = FALSE)
+knitr::opts_knit$set(root.dir = root)
+```
+
+> **Status.** These checks apply to the distributed-lag specification of `05`, which
+> `07_diagnostics_and_lp.Rmd` sets aside. The exposure-construction checks here (trimming,
+> QCEW suppression, channel separation) are repeated for the main specification in
+> `08_event_study_levels.Rmd`, section 5. This file is kept as a record of that analysis.
+
+This file takes the exposure measures built in `05_exposure_and_estimation.Rmd` as given and
+asks whether the cumulative-effect estimates survive four changes: trimming extreme exposure,
+treating QCEW-suppressed employment cells as missing rather than zero, separating the IP and
+RIC channels that move together, and changing the lead/lag window.
+
+**Run `05_exposure_and_estimation.Rmd` first.** This file reads its saved outputs.
+
+# 0. Parameters and shared machinery
+
+```{r params}
+G <- 3; M <- 9                        # baseline lead/lag window, as in 05
+base_year  <- 2024
+est_start  <- as.Date("2024-01-01")
+last_month <- as.Date("2026-03-01")
+est_end    <- seq(last_month, by = paste0("-", G, " months"), length.out = 2)[2]
+
+tag <- function(m) ifelse(m < 0, paste0("f", abs(m)), paste0("l", m))
+terms_for <- function(G, M, which = c("IP", "RIC"))
+  unlist(lapply(which, function(p) paste0(p, "_", tag(-G:M))))
+
+add_lags <- function(Z, G, M) {
+  Z <- copy(Z); setorder(Z, fips, date)
+  for (m in -G:M) {
+    Z[, paste0("IP_",  tag(m)) := shift(dIP,  n = m, type = "lag"), by = fips]
+    Z[, paste0("RIC_", tag(m)) := shift(dRIC, n = m, type = "lag"), by = fips]
+  }
+  Z[]
+}
+
+fit_dl <- function(data, G, M, y = "unemp_rate", fe = "fips^cal_month + date",
+                   wt = NULL, which = c("IP", "RIC")) {
+  tt <- terms_for(G, M, which)
+  fml <- as.formula(paste0(y, " ~ ", paste(tt, collapse = " + "), " | ", fe))
+  f <- feols(fml, data = data, cluster = ~state, weights = wt)
+  dropped <- setdiff(tt, names(coef(f)))
+  if (length(dropped)) stop("Collinear terms dropped: ", paste(dropped, collapse = ", "))
+  f
+}
+
+# delta_k = running sum of beta_m, with delta_k = 0 for k < -G
+cum_effects <- function(fit, prefix, G, M) {
+  ms <- -G:M; nm <- paste0(prefix, "_", tag(ms))
+  b <- coef(fit)[nm]; V <- vcov(fit)[nm, nm]
+  res <- rbindlist(lapply(seq_along(ms), function(j) {
+    a <- as.numeric(seq_along(ms) <= j)
+    data.table(k = ms[j], est = sum(a * b), se = sqrt(drop(t(a) %*% V %*% a)))
+  }))
+  rbind(data.table(k = -G - 1, est = 0, se = 0), res)
+}
+
+cum_table <- function(fits, G, M) {
+  rbindlist(lapply(names(fits), function(s)
+    rbind(cum_effects(fits[[s]], "IP",  G, M)[, exposure := "Import protection (IP)"],
+          cum_effects(fits[[s]], "RIC", G, M)[, exposure := "Rising input costs (RIC)"])[, spec := s]
+  ))[, `:=`(lo = est - 1.96 * se, hi = est + 1.96 * se)][]
+}
+
+wald_leads <- function(fit, prefix, G) {
+  nm <- paste0(prefix, "_f", G:1)
+  b <- coef(fit)[nm]; V <- vcov(fit)[nm, nm]
+  W <- drop(t(b) %*% solve(V) %*% b)
+  data.table(chi2 = round(W, 2), df = length(nm),
+             p_value = round(pchisq(W, length(nm), lower.tail = FALSE), 3))
+}
+
+plot_cum <- function(cum, title, sub = NULL, file = NULL) {
+  p <- ggplot(cum, aes(k, est, colour = spec, fill = spec)) +
+    geom_hline(yintercept = 0, colour = "grey50") +
+    geom_vline(xintercept = -0.5, linetype = "dashed", colour = "grey60") +
+    geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.12, colour = NA) +
+    geom_line(linewidth = 0.85) +
+    facet_wrap(~exposure, scales = "free_y") +
+    labs(title = title, subtitle = sub, x = "Months since exposure change (k)",
+         y = "percentage points", colour = NULL, fill = NULL) +
+    theme_minimal(base_size = 12) + theme(legend.position = "bottom")
+  if (!is.null(file)) ggsave(file.path(figd, file), p, width = 9, height = 5, dpi = 150)
+  p
+}
+```
+
+# 1. Rebuild the estimation panel
+
+```{r panel}
+ce <- fread(file.path(proc, "county_exposure_monthly.csv.gz"), colClasses = list(character = "fips"))
+ce[, date := as.Date(date)]
+
+laus <- fread(file.path(proc, "laus_county_unemployment.csv"),
+              colClasses = list(character = c("fips", "state_fips")))
+laus[, date := as.Date(date)]; setorder(laus, fips, date)
+laus[, d12_u := unemp_rate - shift(unemp_rate, 12), by = fips]
+
+qpath <- c(file.path(proc, sprintf("qcew_county_industry_%d.parquet", base_year)),
+           file.path(proc, sprintf("qcew_county_industry_%d.csv.gz", base_year)))
+qpath <- qpath[file.exists(qpath)][1]
+q <- if (grepl("parquet$", qpath)) as.data.table(arrow::read_parquet(qpath)) else
+  fread(qpath, colClasses = list(character = c("area_fips", "agglvl_code", "own_code", "industry_code")))
+q[, `:=`(area_fips = as.character(area_fips), agglvl_code = as.character(agglvl_code),
+         own_code = as.character(own_code), industry_code = as.character(industry_code))]
+Nc <- q[agglvl_code == "70" & own_code == "0", .(fips = area_fips, N_c = emp_avg)]
+
+make_panel <- function(ce_in) {
+  grid_dates <- seq(as.Date("2023-01-01"), last_month, by = "month")
+  Z <- CJ(fips = unique(ce_in$fips), date = grid_dates)
+  Z <- merge(Z, ce_in, by = c("fips", "date"), all.x = TRUE)
+  Z[is.na(dIP), dIP := 0]; Z[is.na(dRIC), dRIC := 0]
+  Z <- add_lags(Z, G, M)
+  d <- merge(Z[date >= est_start & date <= est_end],
+             laus[, .(fips, date, unemp_rate, d12_u)], by = c("fips", "date"))
+  d <- merge(d, Nc, by = "fips")
+  d[, `:=`(state = substr(fips, 1, 2), cal_month = month(date))][]
+}
+dat <- make_panel(ce)
+cat(nrow(dat), "county-month rows;", uniqueN(dat$fips), "counties\n")
+```
+
+# 2. Channel separation: IP and RIC move together
+
+AT2026's Figure 12 shows the two exposure measures tracking each other closely, so the
+joint specification identifies each channel off a small amount of independent variation.
+If IP-only and RIC-only estimates differ sharply from the joint ones, the separation is fragile.
+
+```{r collinear}
+cors <- dat[, .(level_corr = cor(IP_l0, RIC_l0, use = "complete.obs"),
+                cum_corr = cor(rowSums(.SD[, paste0("IP_", tag(0:M)), with = FALSE]),
+                               rowSums(.SD[, paste0("RIC_", tag(0:M)), with = FALSE]),
+                               use = "complete.obs")),
+            .SDcols = terms_for(G, M)]
+cors
+```
+
+```{r channels}
+fit_joint   <- fit_dl(dat, G, M)
+fit_ip      <- fit_dl(dat, G, M, which = "IP")
+fit_ric     <- fit_dl(dat, G, M, which = "RIC")
+
+cum_ch <- rbind(
+  cum_effects(fit_joint, "IP",  G, M)[, `:=`(exposure = "Import protection (IP)", spec = "Joint (baseline)")],
+  cum_effects(fit_ip,    "IP",  G, M)[, `:=`(exposure = "Import protection (IP)", spec = "Single channel only")],
+  cum_effects(fit_joint, "RIC", G, M)[, `:=`(exposure = "Rising input costs (RIC)", spec = "Joint (baseline)")],
+  cum_effects(fit_ric,   "RIC", G, M)[, `:=`(exposure = "Rising input costs (RIC)", spec = "Single channel only")])
+cum_ch[, `:=`(lo = est - 1.96 * se, hi = est + 1.96 * se)]
+plot_cum(cum_ch, "Joint vs single-channel estimates",
+         "If the lines diverge, IP and RIC are not separately identified",
+         "rob_fig_channels.png")
+```
+
+# 3. Trimming extreme exposure
+
+AT2026's Table 5 columns (3)-(4) "exclude the top one percent of observations in the direct
+exposure measure." We trim on the cumulative Local IP level (the direct measure), and also
+report a two-sided trim.
+
+```{r trim}
+dat[, IP_cum := rowSums(.SD), .SDcols = paste0("IP_", tag(0:M))]
+cut_hi <- quantile(dat$IP_cum, 0.99, na.rm = TRUE)
+cut_lo <- quantile(dat$IP_cum, 0.01, na.rm = TRUE)
+
+fits_trim <- list(
+  "Untrimmed"            = fit_joint,
+  "Trim top 1% (AT2026)" = fit_dl(dat[IP_cum < cut_hi], G, M),
+  "Trim both tails 1%"   = fit_dl(dat[IP_cum > cut_lo & IP_cum < cut_hi], G, M))
+cat(sprintf("Rows: untrimmed %s | top-1%% trimmed %s | two-sided %s\n",
+            format(nrow(dat), big.mark = ","),
+            format(nrow(dat[IP_cum < cut_hi]), big.mark = ","),
+            format(nrow(dat[IP_cum > cut_lo & IP_cum < cut_hi]), big.mark = ",")))
+plot_cum(cum_table(fits_trim, G, M), "Sensitivity to trimming extreme exposure",
+         file = "rob_fig_trim.png")
+```
+
+# 4. QCEW suppression: zero vs imputed
+
+`03_build_qcew_county.py` reports that the median county discloses only about half of its
+manufacturing employment at NAICS-3. The baseline treats suppressed cells as **zero**, which
+mechanically understates exposure in small counties. Here we instead **impute** them: for each
+county, the gap between sector 31-33 total employment and the sum of its disclosed NAICS-3
+manufacturing cells is allocated across that county's suppressed manufacturing cells in
+proportion to the national employment distribution of those industries.
+
+This fixes manufacturing only; suppressed non-manufacturing cells stay at zero.
+
+```{r suppression}
+ind_path <- file.path(proc, "industry_exposure_monthly.csv.gz")
+have_ind <- file.exists(ind_path)
+if (!have_ind) {
+  cat("industry_exposure_monthly.csv.gz not found.\n",
+      "Re-run 05_exposure_and_estimation.Rmd (it now saves this file), then re-knit.\n")
+}
+```
+
+```{r suppression_build, eval=have_ind}
+MFG3 <- setdiff(as.character(311:339), c("317", "318", "319", "328", "329", "338"))
+
+disc <- q[agglvl_code == "75" & own_code == "5" & industry_code %in% MFG3,
+          .(fips = area_fips, naics3 = industry_code, emp = emp_avg)]
+sec  <- q[agglvl_code == "74" & own_code == "5" & industry_code == "31-33",
+          .(fips = area_fips, sector_emp = emp_avg)]
+natl <- disc[!is.na(emp), .(natl_emp = sum(emp)), by = naics3][, w := natl_emp / sum(natl_emp)]
+
+imp <- merge(disc, sec, by = "fips")
+imp <- merge(imp, natl[, .(naics3, w)], by = "naics3")
+imp[, disclosed_sum := sum(emp, na.rm = TRUE), by = fips]
+imp[, gap := pmax(sector_emp - disclosed_sum, 0)]
+imp[, w_supp := fifelse(is.na(emp), w, 0)]
+imp[, w_supp := w_supp / sum(w_supp), by = fips]          # NaN where nothing is suppressed
+imp[, emp_imputed := fifelse(is.na(emp), fifelse(is.finite(w_supp), gap * w_supp, 0), emp)]
+
+cat(sprintf("Manufacturing employment: disclosed %s, imputed into suppressed cells %s (+%.1f%%)\n",
+            format(round(sum(imp$emp, na.rm = TRUE)), big.mark = ","),
+            format(round(sum(imp$emp_imputed[is.na(imp$emp)])), big.mark = ","),
+            100 * sum(imp$emp_imputed[is.na(imp$emp)]) / sum(imp$emp, na.rm = TRUE)))
+
+# county shares with imputed manufacturing, zeros elsewhere
+shr_other <- q[agglvl_code == "75" & own_code == "5" & !industry_code %in% MFG3,
+               .(fips = area_fips, naics3 = industry_code,
+                 emp = fifelse(is.na(emp_avg), 0, emp_avg))]
+shr_imp <- rbind(imp[, .(fips, naics3, emp = emp_imputed)], shr_other)
+shr_imp <- merge(shr_imp, Nc, by = "fips")[N_c > 0][, share := emp / N_c]
+
+ind_exp <- fread(ind_path, colClasses = list(character = c("naics3", "bea")))
+ind_exp[, date := as.Date(date)]
+ce_imp <- merge(shr_imp[, .(fips, naics3, share)], ind_exp[, .(naics3, date, dIP, dRIC)],
+                by = "naics3", allow.cartesian = TRUE)
+ce_imp <- ce_imp[, .(dIP = sum(share * dIP), dRIC = sum(share * dRIC)), by = .(fips, date)]
+
+cat(sprintf("Mean |Local IP| : zeros %.4f, imputed %.4f (ratio %.2fx)\n",
+            mean(abs(ce$dIP)), mean(abs(ce_imp$dIP)), mean(abs(ce_imp$dIP)) / mean(abs(ce$dIP))))
+dat_imp <- make_panel(ce_imp)
+```
+
+```{r suppression_fit, eval=have_ind}
+fits_sup <- list("Suppressed = 0 (baseline)" = fit_joint,
+                 "Suppressed imputed"        = fit_dl(dat_imp, G, M))
+plot_cum(cum_table(fits_sup, G, M), "Sensitivity to QCEW suppression handling",
+         "Imputation raises exposure in small manufacturing counties", "rob_fig_suppression.png")
+```
+
+# 5. Exposure quartiles: cutting on RIC as well as IP
+
+In `05` the predicted tariff contribution looked similar for high- and low-IP counties. That
+plot cut counties by IP exposure while the plotted contribution summed **both** channels, so a
+common RIC movement could mask the IP gradient. Here we cut on each channel and plot its own
+contribution separately.
+
+```{r quartiles}
+cols_ip  <- paste0("IP_",  tag(0:M)); cols_ric <- paste0("RIC_", tag(0:M))
+dat[, TE_IP  := drop(as.matrix(.SD) %*% coef(fit_joint)[cols_ip]),  .SDcols = cols_ip]
+dat[, TE_RIC := drop(as.matrix(.SD) %*% coef(fit_joint)[cols_ric]), .SDcols = cols_ric]
+
+wq <- function(x, w, p) { o <- order(x); cw <- cumsum(w[o]) / sum(w)
+                          x[o][vapply(p, function(z) which(cw >= z)[1], 1L)] }
+cty <- dat[, .(ip = mean(TE_IP), ric = mean(TE_RIC), N_c = first(N_c)), by = fips]
+
+make_q <- function(var, lab) {
+  cut <- wq(cty[[var]], cty$N_c, c(0.25, 0.75))
+  g <- cty[, .(fips, g = fifelse(get(var) <= cut[1], "Bottom 25%",
+                                 fifelse(get(var) >= cut[2], "Top 25%", NA_character_)))][!is.na(g)]
+  m <- merge(dat, g, by = "fips")[!is.na(unemp_rate)]
+  col <- if (var == "ip") "TE_IP" else "TE_RIC"
+  m[, .(TE = sum(get(col) * N_c) / sum(N_c)), by = .(g, date)][, channel := lab][]
+}
+qd <- rbind(make_q("ip", "IP exposure, IP contribution"),
+            make_q("ric", "RIC exposure, RIC contribution"))
+
+ggplot(qd, aes(date, TE, colour = g)) + geom_hline(yintercept = 0, colour = "grey60") +
+  geom_line(linewidth = 0.85) + facet_wrap(~channel, scales = "free_y") +
+  labs(title = "Predicted contribution to unemployment, by own-channel exposure",
+       x = NULL, y = "percentage points", colour = NULL) +
+  theme_minimal(base_size = 12) + theme(legend.position = "bottom")
+ggsave(file.path(figd, "rob_fig_quartiles.png"), width = 9, height = 4.8, dpi = 150)
+```
+
+# 6. Lag-window sensitivity
+
+The baseline window (G = 3, M = 9) is a judgement call. Shorter windows use more months of
+data; longer ones trace more of the response but cost sample and precision.
+
+```{r windows}
+windows <- list(c(3, 6), c(3, 9), c(3, 12), c(6, 9))
+cum_w <- rbindlist(lapply(windows, function(gm) {
+  g <- gm[1]; mm <- gm[2]
+  ee <- seq(last_month, by = paste0("-", g, " months"), length.out = 2)[2]
+  Z <- CJ(fips = unique(ce$fips), date = seq(as.Date("2023-01-01"), last_month, by = "month"))
+  Z <- merge(Z, ce, by = c("fips", "date"), all.x = TRUE)
+  Z[is.na(dIP), dIP := 0]; Z[is.na(dRIC), dRIC := 0]
+  Z <- add_lags(Z, g, mm)
+  d <- merge(Z[date >= est_start & date <= ee], laus[, .(fips, date, unemp_rate)], by = c("fips", "date"))
+  d <- merge(d, Nc, by = "fips")[, `:=`(state = substr(fips, 1, 2), cal_month = month(date))]
+  f <- fit_dl(d, g, mm)
+  rbind(cum_effects(f, "IP",  g, mm)[, exposure := "Import protection (IP)"],
+        cum_effects(f, "RIC", g, mm)[, exposure := "Rising input costs (RIC)"]
+  )[, spec := sprintf("G=%d, M=%d (n=%s)", g, mm, format(nrow(d), big.mark = ","))][]
+}))
+cum_w[, `:=`(lo = est - 1.96 * se, hi = est + 1.96 * se)]
+plot_cum(cum_w, "Sensitivity to the lead/lag window", file = "rob_fig_windows.png")
+```
+
+# 7. Summary: long-run cumulative effect across specifications
+
+$\delta_M$, the cumulative effect after the full lag window, with its standard error and
+a pre-trend test for each specification.
+
+```{r summary}
+all_fits <- c(list("Baseline (joint, county x month FE)" = fit_joint,
+                   "IP only" = fit_ip, "RIC only" = fit_ric),
+              fits_trim[-1],
+              if (have_ind) list("Suppressed imputed" = fits_sup[[2]]) else NULL)
+
+summ <- rbindlist(lapply(names(all_fits), function(s) {
+  f <- all_fits[[s]]
+  rbindlist(lapply(c("IP", "RIC"), function(p) {
+    if (!paste0(p, "_l0") %in% names(coef(f))) return(NULL)
+    d <- cum_effects(f, p, G, M)[k == M]
+    cbind(data.table(spec = s, channel = p,
+                     delta_M = round(d$est, 3), se = round(d$se, 3),
+                     t = round(d$est / d$se, 2),
+                     sig = fifelse(abs(d$est / d$se) > 1.96, "*", "")),
+          wald_leads(f, p, G)[, .(pretrend_p = p_value)])
+  }))
+}))
+summ
+```
+
+```{r summary_save}
+fwrite(summ, file.path(root, "output", "robustness_summary.csv"))
+cat("Wrote output/robustness_summary.csv\n")
+```
+
+# 8. What this does and does not settle
+
+* **Settled here:** whether the estimates move with trimming, suppression handling, channel
+  separation, or the lag window.
+* **Still open:** shift-share-robust standard errors (Adao-Kolesar-Morales), instrumenting
+  realized exposure with statutory tariffs, the 2023 base-year check (needs the 2023 QCEW
+  download), and the Figure 12 level discrepancy noted in `05`.
+* **Reading the summary table:** `delta_M` is the cumulative effect after `M` months per unit of
+  exposure, in percentage points of the unemployment rate. A specification whose sign or
+  significance flips relative to the baseline is a finding worth reporting, not a bug to fix.

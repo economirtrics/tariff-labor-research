@@ -1,0 +1,15 @@
+QCEW COUNTY BUILD QA (2024)
+============================================================
+Files read: 3,143 counties (skipped 1,308 non-county / territory files)
+Total covered employment (sum over counties): 149,493,075
+Private employment share of total: 85.0%
+Counties missing a total-employment row: 0
+
+NAICS-3 suppression (private):
+  industry-county cells: 192,863; fully suppressed: 37.9%
+
+Manufacturing visible at NAICS-3 (sum of disclosed 3-digit / sector 31-33):
+  counties with manufacturing: 2,821
+  employment-weighted coverage: 84.5%
+  median county coverage: 53.4%
+  counties with coverage < 50%: 47.7%

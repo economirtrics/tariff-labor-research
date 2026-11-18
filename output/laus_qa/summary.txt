@@ -1,0 +1,9 @@
+LAUS CONVERSION QA
+============================================================
+Rows written: 179,151  (3,143 counties)
+Date range: 2022-01-01 to 2026-09-01
+Counties per year: 2022: 3,143, 2023: 3,143, 2024: 3,143, 2025: 3,143, 2026: 3,143
+Missing unemp_rate observations: 3,143
+  months with missing values (counties affected): 2025-10-01 (3,143)
+Connecticut codes: ['09110', '09120', '09130', '09140', '09150', '09160', '09170', '09180', '09190']
+Preliminary (P) rows: 3,143

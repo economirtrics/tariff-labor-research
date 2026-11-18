@@ -1,0 +1,470 @@
+---
+title: "Tariff exposure and county unemployment: an event study in levels"
+subtitle: "Main results. Fixed 2025 exposure interacted with calendar months"
+author: "Amir Azlan, University of Illinois Urbana-Champaign"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: paged
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 9, fig.height = 4.8, dpi = 110)
+library(data.table); library(ggplot2); library(fixest)
+
+find_root <- function(start = getwd()) {
+  p <- normalizePath(start)
+  while (!dir.exists(file.path(p, "data", "processed")) && dirname(p) != p) p <- dirname(p)
+  p
+}
+root <- find_root()
+proc <- file.path(root, "data", "processed")
+outd <- file.path(root, "output")
+figd <- file.path(outd, "figures"); dir.create(figd, recursive = TRUE, showWarnings = FALSE)
+knitr::opts_knit$set(root.dir = root)
+```
+
+# 0. Design
+
+The 2025 tariffs reached every county in the same months. Counties differ in **dose**, through
+their industry mix, and not in **timing**. A design built on event-time lags (the distributed
+lag in `05`, the local projections in `07`) asks the data for timing variation it does not
+have; `07` documents how those estimates break down. The design that fits a synchronized
+shock with continuous intensity is the one used by Flaaen & Pierce (2024), on which
+Azzimonti & Titcomb (2026) (AT2026) build: hold each county's exposure **fixed**, and let its
+relationship with the outcome vary by calendar month.
+
+$$
+u_{c,t}=\alpha_{c,m(t)}+\gamma_t+\sum_{s\,\notin\,2024}\Big(\beta^{IP}_s\,IP_c+\beta^{RIC}_s\,RIC_c\Big)\mathbf{1}\{t=s\}+\varepsilon_{c,t}
+$$
+
+* $u_{c,t}$ is the county unemployment rate **in levels** (percent), from LAUS.
+* $IP_c$ and $RIC_c$ are the county's cumulative 2025 change in Local Import Protection and
+  Local Rising Input Costs (built in `05` from HTS-10 customs data, the BEA use table and
+  2024 QCEW employment shares). They are single numbers per county.
+* $\alpha_{c,m(t)}$ is a county x calendar-month fixed effect. LAUS county series are not
+  seasonally adjusted, and seasonal patterns differ with industry mix, so each county gets
+  its own seasonal profile. $\gamma_t$ is a date fixed effect.
+* **All twelve months of 2024 are the reference period.** With county x calendar-month
+  effects, one reference is needed per calendar month. $\beta_s$ is therefore the
+  unemployment gap between high- and low-exposure counties in month $s$, relative to the gap
+  in the same calendar month of 2024.
+* **2023 months are placebos**: the tariffs had not happened, so $\beta_s$ should be zero.
+* Standard errors are clustered by state.
+
+Both exposure measures are divided by their 10th-90th percentile spread across counties, so
+every coefficient reads directly as **percentage points of unemployment for a county at the
+90th percentile of exposure relative to one at the 10th**.
+
+```{r params}
+panel_start <- as.Date("2023-01-01")   # 2023 = placebo year
+ref_year    <- 2024                    # reference year (pre-tariff)
+shock_start <- as.Date("2025-01-01")   # exposure = cumulative change over this window
+shock_end   <- as.Date("2025-12-01")
+main_month  <- as.Date("2025-04-01")   # realized tariff rates rise sharply from April 2025
+base_year_qcew <- 2024
+```
+
+# 1. Data
+
+```{r data}
+ce <- fread(file.path(proc, "county_exposure_monthly.csv.gz"), colClasses = list(character = "fips"))
+ce[, date := as.Date(date)]
+
+laus <- fread(file.path(proc, "laus_county_unemployment.csv"),
+              colClasses = list(character = c("fips", "state_fips")))
+laus[, date := as.Date(date)]
+laus <- laus[date >= panel_start & !is.na(unemp_rate), .(fips, date, unemp_rate)]
+
+qpath <- c(file.path(proc, sprintf("qcew_county_industry_%d.parquet", base_year_qcew)),
+           file.path(proc, sprintf("qcew_county_industry_%d.csv.gz", base_year_qcew)))
+qpath <- qpath[file.exists(qpath)][1]
+q <- if (grepl("parquet$", qpath)) as.data.table(arrow::read_parquet(qpath)) else
+  fread(qpath, colClasses = list(character = c("area_fips", "agglvl_code", "own_code", "industry_code")))
+q[, `:=`(area_fips = as.character(area_fips), agglvl_code = as.character(agglvl_code),
+         own_code = as.character(own_code), industry_code = as.character(industry_code))]
+Nc <- q[agglvl_code == "70" & own_code == "0", .(fips = area_fips, N_c = emp_avg)]
+Nc <- Nc[!is.na(N_c) & N_c > 0]
+
+all_months <- sort(unique(laus$date))      # October 2025 is absent: LAUS has no county data
+mtag <- function(d) format(d, "%Y%m")
+cat(sprintf("Outcome months: %s to %s (%d months; missing: %s)\n", min(all_months), max(all_months),
+            length(all_months),
+            paste(format(setdiff(as.character(seq(min(all_months), max(all_months), by = "month")),
+                                 as.character(all_months))), collapse = ", ")))
+```
+
+# 2. Fixed county exposure
+
+```{r exposure}
+fixed_exposure <- function(ce_dt, from = shock_start, to = shock_end)
+  ce_dt[date >= from & date <= to, .(IP_fix = sum(dIP), RIC_fix = sum(dRIC)), by = fips]
+
+ex <- fixed_exposure(ce)
+qs <- c(.10, .25, .50, .75, .90, .99)
+data.table(measure = c("Local IP, 2025 cumulative change", "Local RIC, 2025 cumulative change"),
+           rbind(round(quantile(ex$IP_fix, qs), 3), round(quantile(ex$RIC_fix, qs), 3)))
+cat(sprintf("Cross-county correlation of IP and RIC exposure: %.3f\n", cor(ex$IP_fix, ex$RIC_fix)))
+```
+
+The correlation above matters for everything that follows. If it is high, the two channels
+are hard to separate and the single-channel estimates in section 5 are the safer reading.
+
+```{r panel_fn}
+# Builds the estimation panel: outcome, scaled exposure, and one exposure x month column
+# per channel and month. Scaling: exposure / (p90 - p10), so coefficients are in
+# percentage points of unemployment per p10 -> p90 difference in exposure.
+make_panel <- function(ex_dt) {
+  e <- copy(ex_dt)
+  sp_ip  <- unname(diff(quantile(e$IP_fix,  c(.10, .90))))
+  sp_ric <- unname(diff(quantile(e$RIC_fix, c(.10, .90))))
+  e[, `:=`(IP_s = IP_fix / sp_ip, RIC_s = RIC_fix / sp_ric)]
+  D <- merge(laus, e[, .(fips, IP_fix, RIC_fix, IP_s, RIC_s)], by = "fips")
+  D <- merge(D, Nc, by = "fips")
+  D[, `:=`(state = substr(fips, 1, 2), cal_month = month(date), yr = year(date))]
+  for (i in seq_along(all_months)) {
+    d <- all_months[i]
+    set(D, j = paste0("IP_",  mtag(d)), value = D$IP_s  * (D$date == d))
+    set(D, j = paste0("RIC_", mtag(d)), value = D$RIC_s * (D$date == d))
+  }
+  D[]
+}
+D <- make_panel(ex)
+cat(sprintf("Panel: %s county-months, %s counties, %d states\n", format(nrow(D), big.mark = ","),
+            format(uniqueN(D$fips), big.mark = ","), uniqueN(D$state)))
+```
+
+# 3. The raw data first
+
+Before any regression: mean unemployment for the most- and least-exposed quarter of
+counties (by IP exposure), and the gap between them. The regression in section 4 is a
+disciplined version of the bottom panel.
+
+```{r raw, fig.height=5.6}
+cut_q <- quantile(ex$IP_fix, c(.25, .75))
+grp <- ex[, .(fips, g = fifelse(IP_fix >= cut_q[2], "Top 25% IP exposure",
+                         fifelse(IP_fix <= cut_q[1], "Bottom 25% IP exposure", NA_character_)))][!is.na(g)]
+raw <- merge(D[, .(fips, date, unemp_rate)], grp, by = "fips")[, .(u = mean(unemp_rate)), by = .(g, date)]
+gap <- dcast(raw, date ~ g, value.var = "u")
+gap[, u := `Top 25% IP exposure` - `Bottom 25% IP exposure`]
+rawp <- rbind(raw[, .(date, series = g, u, panel = "Unemployment rate (percent)")],
+              gap[, .(date, series = "Top minus bottom", u, panel = "Gap (percentage points)")])
+rawp[, panel := factor(panel, levels = c("Unemployment rate (percent)", "Gap (percentage points)"))]
+
+ggplot(rawp, aes(date, u, colour = series)) +
+  geom_vline(xintercept = main_month, linetype = "dashed", colour = "grey50") +
+  geom_line(linewidth = 0.8) + facet_wrap(~panel, ncol = 1, scales = "free_y") +
+  labs(title = "County unemployment by tariff exposure (raw means, not seasonally adjusted)",
+       subtitle = "Dashed line: April 2025. October 2025 is missing in LAUS",
+       x = NULL, y = NULL, colour = NULL) +
+  theme_minimal(base_size = 12) + theme(legend.position = "bottom")
+ggsave(file.path(figd, "main_fig_raw_groups.png"), width = 9, height = 5.6, dpi = 150)
+```
+
+# 4. Event study
+
+```{r machinery}
+ev_months <- all_months[year(all_months) != ref_year]
+
+fit_es <- function(data, months = ev_months, which = c("IP", "RIC"),
+                   fe = "fips^cal_month + date", wt = NULL, y = "unemp_rate") {
+  tt <- unlist(lapply(which, function(p) paste0(p, "_", mtag(months))))
+  f <- feols(as.formula(paste(y, "~", paste(tt, collapse = " + "), "|", fe)),
+             data = data, cluster = ~state, weights = wt)
+  dropped <- setdiff(tt, names(coef(f)))
+  if (length(dropped)) warning("Collinear terms dropped: ", paste(dropped, collapse = ", "), call. = FALSE)
+  f
+}
+
+# monthly coefficient path, with the reference months added back as zeros
+coef_path <- function(fit, prefix, months = ev_months, ref = all_months[year(all_months) == ref_year]) {
+  nm <- paste0(prefix, "_", mtag(months)); ok <- nm %in% names(coef(fit))
+  p <- data.table(date = months[ok], est = unname(coef(fit)[nm[ok]]), se = unname(se(fit)[nm[ok]]))
+  p <- rbind(p, data.table(date = ref, est = 0, se = 0))
+  setorder(p, date)
+  p[, `:=`(lo = est - 1.96 * se, hi = est + 1.96 * se)][]
+}
+
+# average of the monthly coefficients over a window, with its standard error
+avg_effect <- function(fit, prefix, months) {
+  nm <- paste0(prefix, "_", mtag(months)); nm <- nm[nm %in% names(coef(fit))]
+  if (!length(nm)) return(NULL)
+  a <- rep(1 / length(nm), length(nm))
+  b <- coef(fit)[nm]; V <- vcov(fit)[nm, nm, drop = FALSE]
+  data.table(est = sum(a * b), se = sqrt(drop(t(a) %*% V %*% a)), n_months = length(nm))
+}
+
+# joint test that every coefficient in a window is zero
+wald_p <- function(fit, prefix, months) {
+  nm <- paste0(prefix, "_", mtag(months)); nm <- nm[nm %in% names(coef(fit))]
+  if (!length(nm)) return(NA_real_)
+  b <- coef(fit)[nm]; V <- vcov(fit)[nm, nm, drop = FALSE]
+  W <- tryCatch(drop(t(b) %*% solve(V) %*% b), error = function(e) NA_real_)
+  pchisq(W, length(nm), lower.tail = FALSE)
+}
+
+yr <- year(all_months)
+windows <- list(
+  "Placebo: 2023"   = all_months[yr == 2023],
+  "2025 Jan-Mar"    = all_months[yr == 2025 & month(all_months) <= 3],
+  "2025 Apr-Dec"    = all_months[yr == 2025 & month(all_months) >= 4],
+  "2026 Jan onward" = all_months[yr == 2026])
+
+summarise_fit <- function(fit, label) {
+  rbindlist(lapply(c("IP", "RIC"), function(p) {
+    rbindlist(lapply(names(windows), function(w) {
+      r <- avg_effect(fit, p, windows[[w]])
+      if (is.null(r)) return(NULL)
+      r[, `:=`(spec = label, channel = p, window = w)]
+      r
+    }))
+  }))
+}
+```
+
+```{r main}
+fit_main <- fit_es(D)
+
+paths <- rbind(coef_path(fit_main, "IP")[,  exposure := "Import protection (IP)"],
+               coef_path(fit_main, "RIC")[, exposure := "Rising input costs (RIC)"])
+
+ggplot(paths, aes(date, est)) +
+  annotate("rect", xmin = as.Date(sprintf("%d-01-01", ref_year)), xmax = as.Date(sprintf("%d-12-01", ref_year)),
+           ymin = -Inf, ymax = Inf, alpha = 0.08) +
+  geom_hline(yintercept = 0, colour = "grey50") +
+  geom_vline(xintercept = main_month, linetype = "dashed", colour = "grey50") +
+  geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.2) +
+  geom_line(linewidth = 0.8) + geom_point(size = 1.3) +
+  facet_wrap(~exposure, ncol = 1, scales = "free_y") +
+  labs(title = "Tariff exposure and county unemployment: event study in levels",
+       subtitle = paste0("Unemployment gap, 90th vs 10th percentile exposure county, relative to the same month of ",
+                         ref_year, " (shaded).\n95% CI, clustered by state. 2023 = placebo. Dashed line: April 2025"),
+       x = NULL, y = "percentage points") +
+  theme_minimal(base_size = 12)
+ggsave(file.path(figd, "main_fig_event_study.png"), width = 9, height = 6.2, dpi = 150)
+```
+
+```{r main_table}
+main_tab <- summarise_fit(fit_main, "Baseline")
+main_tab[, `:=`(t = est / se, lo = est - 1.96 * se, hi = est + 1.96 * se)]
+main_tab[, .(channel, window, months = n_months, `effect (pp)` = round(est, 3), se = round(se, 3),
+             t = round(t, 2), `95% CI` = sprintf("[%.3f, %.3f]", lo, hi))]
+```
+
+Each row is the average of the monthly coefficients in that window: the unemployment-rate
+difference, in percentage points, between a 90th- and a 10th-percentile exposure county,
+relative to 2024.
+
+## 4.1 Pre-trends
+
+The 2023 coefficients are the test of the design. Two versions: the average 2023 coefficient
+(the "Placebo: 2023" rows above) and a joint test that all twelve are zero. The joint test
+uses 12 restrictions with about 50 state clusters and tends to over-reject, so read it
+together with the average and with the figure.
+
+```{r pretrend}
+data.table(channel = c("IP", "RIC"),
+           `joint p-value, all 2023 months = 0` =
+             round(c(wald_p(fit_main, "IP", windows[[1]]), wald_p(fit_main, "RIC", windows[[1]])), 3),
+           `average 2023 coefficient (pp)` =
+             round(c(avg_effect(fit_main, "IP", windows[[1]])$est, avg_effect(fit_main, "RIC", windows[[1]])$est), 3),
+           `t` = round(c(avg_effect(fit_main, "IP", windows[[1]])[, est / se],
+                         avg_effect(fit_main, "RIC", windows[[1]])[, est / se]), 2))
+```
+
+## 4.2 What could this design have detected?
+
+A null is informative only if the design could have found a plausible effect. The smallest
+effect detectable with 80% power at the 5% level is about 2.8 standard errors.
+
+```{r mde}
+mde <- main_tab[window %in% c("2025 Apr-Dec", "2026 Jan onward"),
+                .(channel, window, `estimate (pp)` = round(est, 3), se = round(se, 3),
+                  `smallest detectable effect (pp)` = round(2.8 * se, 3))]
+mde
+cat(sprintf("For scale: mean county unemployment rate in %d was %.2f percent (sd across counties %.2f).\n",
+            ref_year, D[yr == ref_year, mean(unemp_rate)],
+            D[yr == ref_year, .(u = mean(unemp_rate)), by = fips][, sd(u)]))
+```
+
+## 4.3 Positive control
+
+Add a known effect to the outcome (`b` percentage points per unit of scaled IP exposure from
+April 2025 on) and re-estimate. Because exposure is a fixed county characteristic, the
+design recovers it exactly; `07` shows that the local-projection design does not have this
+property. A recovered value different from `b` would indicate a coding error.
+
+```{r positive_control}
+base_post <- avg_effect(fit_main, "IP", windows[["2025 Apr-Dec"]])$est
+pc <- rbindlist(lapply(c(0.1, 0.5), function(b) {
+  d <- copy(D)
+  d[, y_sim := unemp_rate + b * IP_s * (date >= main_month)]
+  f <- fit_es(d, y = "y_sim")
+  data.table(injected = b, recovered = avg_effect(f, "IP", windows[["2025 Apr-Dec"]])$est - base_post)
+}))
+pc[, recovered := round(recovered, 6)][]
+```
+
+# 5. Robustness
+
+Each row changes one thing relative to the baseline.
+
+```{r robustness_fits}
+specs <- list()
+specs[["Baseline"]] <- fit_main
+
+# (a) one channel at a time: IP and RIC are correlated across counties
+specs[["IP only"]]  <- fit_es(D, which = "IP")
+specs[["RIC only"]] <- fit_es(D, which = "RIC")
+
+# (b) no county-specific seasonality: county + date FE, December of the reference year as base
+base_m <- as.Date(sprintf("%d-12-01", ref_year))
+specs[["County + date FE, base Dec 2024"]] <-
+  fit_es(D, months = all_months[all_months != base_m], fe = "fips + date")
+
+# (c) weight counties by 2024 employment
+specs[["Employment-weighted"]] <- fit_es(D, wt = ~N_c)
+
+# (d) drop counties in the top 1% of IP exposure (AT2026 Table 5, columns 3-4)
+keep <- ex[IP_fix < quantile(IP_fix, 0.99), fips]
+specs[["Trim top 1% IP exposure"]] <- fit_es(D[fips %in% keep])
+
+# (e) exposure measured to the October 2025 peak in realized tariff rates
+specs[["Exposure through Oct 2025"]] <-
+  fit_es(make_panel(fixed_exposure(ce, to = as.Date("2025-10-01"))))
+```
+
+```{r robustness_suppression}
+# (f) QCEW suppression: impute suppressed manufacturing cells instead of treating them as zero
+ind_path <- file.path(proc, "industry_exposure_monthly.csv.gz")
+if (file.exists(ind_path)) {
+  MFG3 <- setdiff(as.character(311:339), c("317", "318", "319", "328", "329", "338"))
+  disc <- q[agglvl_code == "75" & own_code == "5" & industry_code %in% MFG3,
+            .(fips = area_fips, naics3 = industry_code, emp = emp_avg)]
+  sec  <- q[agglvl_code == "74" & own_code == "5" & industry_code == "31-33",
+            .(fips = area_fips, sector_emp = emp_avg)]
+  natl <- disc[!is.na(emp), .(natl_emp = sum(emp)), by = naics3][, w := natl_emp / sum(natl_emp)]
+  imp <- merge(disc, sec, by = "fips")
+  imp <- merge(imp, natl[, .(naics3, w)], by = "naics3")
+  imp[, disclosed_sum := sum(emp, na.rm = TRUE), by = fips]
+  # if the county's whole sector 31-33 total is suppressed there is nothing to impute from
+  imp[, gap := fifelse(is.na(sector_emp), 0, pmax(sector_emp - disclosed_sum, 0))]
+  imp[, w_supp := fifelse(is.na(emp), w, 0)]
+  imp[, w_supp := w_supp / sum(w_supp), by = fips]
+  imp[, emp_imputed := fifelse(is.na(emp), fifelse(is.finite(w_supp), gap * w_supp, 0), emp)]
+  imp[is.na(emp_imputed), emp_imputed := 0]
+  shr_other <- q[agglvl_code == "75" & own_code == "5" & !industry_code %in% MFG3,
+                 .(fips = area_fips, naics3 = industry_code, emp = fifelse(is.na(emp_avg), 0, emp_avg))]
+  shr_imp <- rbind(imp[, .(fips, naics3, emp = emp_imputed)], shr_other)
+  shr_imp <- merge(shr_imp, Nc, by = "fips")[, share := emp / N_c]
+  ind_exp <- fread(ind_path, colClasses = list(character = c("naics3", "bea")))
+  ind_exp[, date := as.Date(date)]
+  ce_imp <- merge(shr_imp[, .(fips, naics3, share)], ind_exp[, .(naics3, date, dIP, dRIC)],
+                  by = "naics3", allow.cartesian = TRUE)
+  ce_imp <- ce_imp[, .(dIP = sum(share * dIP), dRIC = sum(share * dRIC)), by = .(fips, date)]
+  specs[["Suppressed QCEW cells imputed"]] <- fit_es(make_panel(fixed_exposure(ce_imp)))
+} else {
+  cat("industry_exposure_monthly.csv.gz not found: re-knit 05 to enable the suppression check.\n")
+}
+```
+
+```{r robustness_table}
+rob <- rbindlist(lapply(names(specs), function(s) summarise_fit(specs[[s]], s)))
+rob[, t := est / se]
+rob[, cell := sprintf("%.3f (%.3f)%s", est, se, fifelse(abs(t) > 1.96, "*", ""))]
+rob[, `:=`(spec = factor(spec, levels = names(specs)), window = factor(window, levels = names(windows)))]
+rob_wide <- dcast(rob, spec + channel ~ window, value.var = "cell")
+pre <- rbindlist(lapply(names(specs), function(s) rbindlist(lapply(c("IP", "RIC"), function(p) {
+  pv <- wald_p(specs[[s]], p, windows[[1]])
+  if (is.na(pv)) NULL else data.table(spec = s, channel = p, `pre-trend joint p` = round(pv, 3))
+}))))
+pre[, spec := factor(spec, levels = names(specs))]
+rob_wide <- merge(rob_wide, pre, by = c("spec", "channel"), all.x = TRUE)
+setorder(rob_wide, channel, spec)
+rob_wide
+```
+
+Cells are the average monthly coefficient in the window with its standard error;
+`*` marks |t| > 1.96. Units are percentage points of unemployment per 10th-to-90th
+percentile difference in exposure (each exposure definition scaled by its own spread).
+
+```{r robustness_fig, fig.height=5.4}
+rp <- rob[window %in% c("2025 Apr-Dec", "2026 Jan onward")]
+rp[, `:=`(lo = est - 1.96 * se, hi = est + 1.96 * se,
+          exposure = fifelse(channel == "IP", "Import protection (IP)", "Rising input costs (RIC)"))]
+ggplot(rp, aes(est, spec)) +
+  geom_vline(xintercept = 0, colour = "grey50") +
+  geom_pointrange(aes(xmin = lo, xmax = hi), size = 0.3) +
+  facet_grid(exposure ~ window, scales = "free_x") +
+  scale_y_discrete(limits = rev) +
+  labs(title = "Average post-period effect across specifications",
+       subtitle = "Percentage points of unemployment, 90th vs 10th percentile exposure; 95% CI",
+       x = NULL, y = NULL) +
+  theme_minimal(base_size = 11)
+ggsave(file.path(figd, "main_fig_robustness.png"), width = 9, height = 5.4, dpi = 150)
+```
+
+# 6. Saved results
+
+```{r save}
+out_main <- main_tab[, .(channel, window, months = n_months, effect_pp = round(est, 4), se = round(se, 4),
+                         t = round(t, 2), ci_low = round(lo, 4), ci_high = round(hi, 4))]
+fwrite(out_main, file.path(outd, "main_results.csv"))
+fwrite(rob[, .(spec, channel, window, effect_pp = round(est, 4), se = round(se, 4), t = round(t, 2))],
+       file.path(outd, "main_results_robustness.csv"))
+fwrite(rbind(paths[, .(exposure, date, est, se)]), file.path(outd, "main_event_study_coefficients.csv"))
+
+md <- c("# Main results",
+        "",
+        sprintf("Generated by `scripts/08_event_study_levels.Rmd` on %s.", format(Sys.Date(), "%B %d, %Y")),
+        "",
+        "Unemployment-rate difference (percentage points) between a county at the 90th and one at the",
+        sprintf("10th percentile of exposure, relative to the same calendar months of %d. Standard errors", ref_year),
+        "clustered by state. `Placebo: 2023` should be zero if the design is valid.",
+        "",
+        "## Baseline", "",
+        knitr::kable(out_main, format = "pipe"),
+        "",
+        "## Across specifications", "",
+        "Average coefficient (standard error); `*` marks |t| > 1.96.", "",
+        knitr::kable(rob_wide, format = "pipe"))
+writeLines(md, file.path(outd, "results_summary.md"))
+cat("Wrote output/main_results.csv, output/main_results_robustness.csv,",
+    "output/main_event_study_coefficients.csv, output/results_summary.md\n")
+```
+
+# 7. Reading the results, and limits
+
+**How to read them**
+
+* The 2023 placebo rows and the pre-trend p-values come first. If high- and low-exposure
+  counties were already diverging between 2023 and 2024, the post-period coefficients do not
+  identify a tariff effect.
+* The `2025 Apr-Dec` and `2026 Jan onward` rows are the estimates of interest. Section 4.2
+  gives the smallest effect this design could have detected; an insignificant estimate with
+  a small detectable effect is evidence of a small effect, and one with a large detectable
+  effect is not.
+* If IP-only and RIC-only estimates differ sharply from the joint ones, the two channels are
+  not separately identified and the single-channel versions should be read as the effect of
+  tariff exposure broadly.
+
+**Limits**
+
+* **One shock, one cross-section.** Identification comes from industry composition. Anything
+  else that hit manufacturing-heavy counties differently in 2025 than in 2024 is attributed
+  to tariffs.
+* **Realized tariffs are outcomes of firm behaviour** (front-loading, sourcing shifts,
+  exemption use). Exposure built from statutory rates would be a useful instrument.
+* **Exposure is fixed at its 2025 change.** Realized tariff rates fell in early 2026 in the
+  customs data, so the 2026 coefficients mix the lagged effect of 2025 with a partial reversal.
+* **Shift-share inference.** State clustering does not address correlation across counties
+  with similar industry mixes (Adao, Kolesar & Morales 2019).
+* **QCEW suppression** hides about half of manufacturing employment at NAICS-3 in the median
+  county; row (f) of the robustness table addresses it for manufacturing only.
+* **LAUS** county estimates are model-based, October 2025 is missing, and 2026 values are
+  preliminary.
+* **Not captured:** retaliation on exports and general-equilibrium effects, as in AT2026.

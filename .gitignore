@@ -1,1 +1,21 @@
+# secrets
+.env
+
+# raw and processed data (thousands of files; rebuild with the scripts)
 data/
+
+# R / editor clutter
+.Rhistory
+.RData
+.Rproj.user/
+*_cache/
+*_files/
+.DS_Store
+__pycache__/
+
+# download bookkeeping
+failed_rerun.csv
+missing_chunks.csv
+*.tmp
+
+# outputs ARE committed on purpose (figures, results tables, rendered reports)

@@ -1,0 +1,57 @@
+TRADE PANEL QA
+============================================================
+Months processed: 39
+Incomplete months (missing chapters): 0
+HS10-months failing value reconciliation: 0 of 702,549
+HS10-months failing duty reconciliation:  0
+Country value / '-' total value (should be 1.000): 1.0000
+Duplicate (hs10, country, month) keys: 0
+Exact duplicate rows dropped: 0
+Rows with HS10 not in concordance map: 0
+Negative-value rows: 0
+
+Realized AETR (duty / value, country rows), percent:
+  month     world   china
+  2023-01    2.55   10.67
+  2023-02    2.45   11.42
+  2023-03    2.16   10.47
+  2023-04    2.36   11.13
+  2023-05    2.37   10.84
+  2023-06    2.35   10.90
+  2023-07    2.44   10.56
+  2023-08    2.38   10.46
+  2023-09    2.34    9.42
+  2023-10    2.25    9.25
+  2023-11    2.18    9.48
+  2023-12    2.32   10.38
+  2024-01    2.48   11.19
+  2024-02    2.42   11.40
+  2024-03    2.20   11.21
+  2024-04    2.15   10.94
+  2024-05    2.23   10.76
+  2024-06    2.32   11.20
+  2024-07    2.46   10.87
+  2024-08    2.50   10.93
+  2024-09    2.39    9.70
+  2024-10    2.37    9.77
+  2024-11    2.33   10.16
+  2024-12    2.31   10.82
+  2025-01    2.24   10.98
+  2025-02    2.37   14.08
+  2025-03    3.70   25.22
+  2025-04    7.12   37.78
+  2025-05    8.96   45.60
+  2025-06    9.07   37.35
+  2025-07    9.43   38.36
+  2025-08   10.24   36.32
+  2025-09   10.49   36.58
+  2025-10   10.82   36.63
+  2025-11    9.65   31.41
+  2025-12    9.20   28.96
+  2026-01    9.83   30.92
+  2026-02    8.38   28.90
+  2026-03    6.78   22.01
+
+Paper's figures for comparison (Azzimonti & Titcomb 2026):
+  world May 2025 = 8.7 ; world Oct 2025 = about 11 ; world Dec 2025 = 9.3 ;
+  China Dec 2025 = 29.2 ; China 2024 average = 10.7

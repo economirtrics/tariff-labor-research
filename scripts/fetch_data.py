@@ -1,4 +1,4 @@
-# Used to collect BLS QCEW, LAUS, attempted to get BEA and USCIS Trade but failed.
+# Downloads BLS QCEW county files and the LAUS county flat file.
 import os
 import requests
 import zipfile
@@ -98,10 +98,3 @@ if __name__ == "__main__":
     # Customs data comes from fetch_missing.py (Census trade API).
     fetch_qcew_annual_area_data(start_year=2024, end_year=2024)
     fetch_laus_county_data()
-
-# Execute full multi-year panel data acquisition
-    #fetch_qcew_annual_area_data(start_year=2021, end_year=2025)
-    #fetch_laus_county_data()
-    #fetch_census_trade_data(CENSUS_KEY)
-    #fetch_bea_io_tables(BEA_KEY)
-    fetch_census_trade_data_by_year(CENSUS_KEY, start_year=2021, end_year=2025)
